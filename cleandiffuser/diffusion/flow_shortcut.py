@@ -1,0 +1,369 @@
+from typing import Optional, Union
+
+import einops
+import torch
+import torch.nn as nn
+
+from cleandiffuser.classifier import BaseClassifier
+from cleandiffuser.diffusion.basic import DiffusionModel
+from cleandiffuser.nn_condition import BaseNNCondition
+from cleandiffuser.nn_diffusion import BaseNNDiffusion
+from cleandiffuser.utils import (
+    TensorDict,
+    at_least_ndim,
+    concat_zeros,
+    dict_apply,
+    get_sampling_scheduler,
+)
+
+
+class ContinuousShortcutFlow(DiffusionModel):
+    """Continuous-time Shortcut Flow Model (Frans et al., 2024).
+
+    Reference: "One Step Diffusion via Shortcut Models", arXiv:2410.12557.
+
+    Note on naming: although this class inherits from ``DiffusionModel`` (the
+    CleanDiffuser framework base that holds EMA / Lightning plumbing), the
+    *generative model* itself is a **flow** model. It is built on the same
+    linear interpolation forward process as ``ContinuousRectifiedFlow`` and
+    uses a pure ODE during sampling — there is no stochastic diffusion term.
+
+    A single network ``s_θ(xt, t, d, c)`` is trained to predict the *average*
+    velocity from time ``t`` to ``t - d`` along the path
+    ``xt = (1 - t)·x0 + t·ε``. When ``d = 0`` this reduces to standard flow
+    matching (instantaneous velocity ``v* = x0 − ε``). When ``d > 0`` it
+    predicts the chord velocity of a finite jump of size ``d``.
+
+    Training uses a hybrid objective on each batch (paper default 75/25):
+
+      * **Flow matching** (``d = 0``, ``fm_consistency_ratio`` of the batch):
+        ``loss_fm = ||s_θ(xt, t, 0, c) − (x0 − ε)||²``
+
+      * **Self-consistency** (``d > 0``, remaining batch fraction):
+        Sample ``d ∈ {2^-K_max, …, 1}``, ``t ~ U[d, 1]``. Using the EMA
+        network for the (stop-grad) target,
+
+            s1     = s_ema(xt, t, d/2, c)
+            x_mid  = xt + (d/2) · s1
+            s2     = s_ema(x_mid, t - d/2, d/2, c)
+            target = stopgrad((s1 + s2) / 2)
+
+        ``loss_sc = ||s_θ(xt, t, d, c) − target||²``
+
+    Sampling integrates the ODE from ``t = 1`` (noise) to ``t = 0`` (data)
+    using Euler-like updates at the chosen ``d``:
+    ``x_{t-d} = xt + d · s_θ(xt, t, d, c)``. Setting ``sample_steps = 1``
+    yields true one-step generation (``d ≈ 1``).
+
+    Args:
+        nn_diffusion (BaseNNDiffusion): Network that supports the extra ``d``
+            kwarg in its ``forward`` (e.g. ``DiT1dShortcut``).
+        nn_condition (Optional[BaseNNCondition]): Optional CFG condition.
+        fix_mask (Optional[torch.Tensor]): Boolean/float mask in ``x_shape``.
+            Marked positions are pinned to ``prior`` at every Euler step.
+        loss_weight (Optional[torch.Tensor]): Per-element loss weight.
+        classifier: Must be ``None`` — classifier guidance is not supported
+            (consistent with ``ContinuousRectifiedFlow``).
+        ema_rate (float): EMA decay for the target network.
+        optimizer_params (Optional[dict]): Same convention as other
+            CleanDiffuser diffusion classes.
+        x_max, x_min (Optional[torch.Tensor]): Output clipping bounds.
+        K_max (int): Largest negative power of two for the shortcut step
+            schedule (``d ∈ {2^-K_max, …, 2^0}``). Default 7 ⇒ 1/128 … 1.
+        fm_consistency_ratio (float): Fraction of each batch trained with
+            ``d = 0`` (pure flow matching). The rest is trained with the
+            self-consistency loss. Default 0.75.
+    """
+
+    def __init__(
+        self,
+        nn_diffusion: BaseNNDiffusion,
+        nn_condition: Optional[BaseNNCondition] = None,
+        fix_mask: Optional[torch.Tensor] = None,
+        loss_weight: Optional[torch.Tensor] = None,
+        classifier: Optional[BaseClassifier] = None,
+        ema_rate: float = 0.9999,
+        optimizer_params: Optional[dict] = None,
+        x_max: Optional[torch.Tensor] = None,
+        x_min: Optional[torch.Tensor] = None,
+        K_max: int = 7,
+        fm_consistency_ratio: float = 0.75,
+    ):
+        super().__init__(
+            nn_diffusion,
+            nn_condition,
+            fix_mask,
+            loss_weight,
+            classifier,
+            ema_rate,
+            optimizer_params,
+        )
+        assert classifier is None, "Shortcut Flow Models do not support classifier-guidance."
+        assert 0.0 < fm_consistency_ratio < 1.0, "fm_consistency_ratio must be in (0, 1)."
+        assert K_max >= 1, "K_max must be >= 1 (need at least d ∈ {1/2, 1})."
+
+        self.K_max = K_max
+        self.fm_consistency_ratio = fm_consistency_ratio
+
+        self.x_max = nn.Parameter(x_max, requires_grad=False) if x_max is not None else None
+        self.x_min = nn.Parameter(x_min, requires_grad=False) if x_min is not None else None
+
+    @property
+    def supported_solvers(self):
+        return ["euler_shortcut"]
+
+    @property
+    def clip_pred(self):
+        return (self.x_max is not None) or (self.x_min is not None)
+
+    # ==================== Training ======================
+
+    def add_noise(
+        self,
+        x0: torch.Tensor,
+        t: Optional[torch.Tensor] = None,
+        eps: Optional[torch.Tensor] = None,
+    ):
+        """Linear-interpolation forward process: ``xt = (1-t)·x0 + t·ε``."""
+        t = torch.rand((x0.shape[0],), device=self.device) if t is None else t
+        eps = torch.randn_like(x0) if eps is None else eps
+        xt = x0 + at_least_ndim(t, x0.dim()) * (eps - x0)
+        xt = xt * (1.0 - self.fix_mask) + x0 * self.fix_mask
+        return xt, t, eps
+
+    def loss(
+        self,
+        x0: torch.Tensor,
+        condition: Optional[Union[torch.Tensor, TensorDict]] = None,
+        x1: Optional[torch.Tensor] = None,
+    ):
+        B = x0.shape[0]
+        if x1 is None:
+            x1 = torch.randn_like(x0)
+        else:
+            assert x0.shape == x1.shape, "x0 and x1 must have the same shape"
+
+        # Encode the condition ONCE (with whatever CFG dropout the condition
+        # module applies in train mode). Re-using the same encoded vector for
+        # both the LHS and the EMA-target RHS keeps the self-consistency
+        # objective well-defined under random label dropout.
+        cond_emb = self.model["condition"](condition) if condition is not None else None
+
+        B_fm = int(round(B * self.fm_consistency_ratio))
+        B_fm = max(0, min(B, B_fm))
+        B_sc = B - B_fm
+
+        total_loss = x0.new_zeros(())
+
+        # ---------- Flow-matching branch (d = 0) ----------
+        if B_fm > 0:
+            x0_fm = x0[:B_fm]
+            x1_fm = x1[:B_fm]
+            t_fm = torch.rand((B_fm,), device=self.device)
+            xt_fm = x0_fm + at_least_ndim(t_fm, x0_fm.dim()) * (x1_fm - x0_fm)
+            xt_fm = xt_fm * (1.0 - self.fix_mask) + x0_fm * self.fix_mask
+            d_fm = torch.zeros((B_fm,), device=self.device)
+            cond_fm = cond_emb[:B_fm] if cond_emb is not None else None
+
+            target_fm = x0_fm - x1_fm  # data-ward velocity (constant along the straight path)
+            pred_fm = self.model["diffusion"](xt_fm, t_fm, cond_fm, d=d_fm)
+            loss_fm = ((pred_fm - target_fm) ** 2 * self.loss_weight * (1 - self.fix_mask)).mean()
+            total_loss = total_loss + loss_fm * (B_fm / B)
+
+        # ---------- Self-consistency branch (d > 0) ----------
+        if B_sc > 0:
+            x0_sc = x0[B_fm:]
+            x1_sc = x1[B_fm:]
+
+            # Sample log2(d) uniformly from {-K_max, …, 0}; d = 2^log2d.
+            log2d = (
+                torch.randint(0, self.K_max + 1, (B_sc,), device=self.device).float()
+                - self.K_max
+            )
+            d_sc = 2.0 ** log2d  # ∈ {2^-K_max, …, 1}
+
+            # Sample t ~ U[d, 1] so the full d-step lands inside [0, 1].
+            t_sc = torch.rand((B_sc,), device=self.device) * (1 - d_sc) + d_sc
+
+            xt_sc = x0_sc + at_least_ndim(t_sc, x0_sc.dim()) * (x1_sc - x0_sc)
+            xt_sc = xt_sc * (1.0 - self.fix_mask) + x0_sc * self.fix_mask
+            cond_sc = cond_emb[B_fm:] if cond_emb is not None else None
+
+            d_half = d_sc / 2
+
+            with torch.no_grad():
+                # First half-step (EMA backbone)
+                s1 = self.model_ema["diffusion"](xt_sc, t_sc, cond_sc, d=d_half)
+                x_mid = xt_sc + at_least_ndim(d_half, xt_sc.dim()) * s1
+                x_mid = x_mid * (1.0 - self.fix_mask) + x0_sc * self.fix_mask
+                # Second half-step (EMA backbone) at time t - d/2
+                t_mid = t_sc - d_half
+                s2 = self.model_ema["diffusion"](x_mid, t_mid, cond_sc, d=d_half)
+                target_sc = (s1 + s2) / 2  # stop-grad target
+
+            pred_sc = self.model["diffusion"](xt_sc, t_sc, cond_sc, d=d_sc)
+            loss_sc = ((pred_sc - target_sc) ** 2 * self.loss_weight * (1 - self.fix_mask)).mean()
+            total_loss = total_loss + loss_sc * (B_sc / B)
+
+        return total_loss
+
+    def update_diffusion(
+        self,
+        x0: torch.Tensor,
+        condition_cfg: Optional[torch.Tensor] = None,
+        update_ema: bool = True,
+        x1: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        return super().update_diffusion(x0, condition_cfg, update_ema, x1=x1)
+
+    def training_step(self, batch, batch_idx):
+        """PyTorch Lightning training step.
+
+        Batch keys:
+            ``x0`` (required): clean data, shape ``(B, *x_shape)``.
+            ``condition_cfg`` (optional): CFG condition.
+            ``x1`` (optional): source-distribution sample. If ``None``,
+                standard Gaussian noise is used.
+        """
+        assert isinstance(batch, dict) and "x0" in batch.keys(), (
+            "The batch should contain the key `x0` for the input data."
+        )
+        x0 = batch["x0"]
+        condition_cfg = batch.get("condition_cfg", None)
+        x1 = batch.get("x1", None)
+
+        loss = self.loss(x0, condition_cfg, x1=x1)
+        self.log("diffusion_loss", loss, prog_bar=True)
+
+        if self.ema_update_schedule(batch_idx):
+            self.ema_update()
+
+        return loss
+
+    # ==================== Sampling ======================
+
+    def sample(
+        self,
+        prior: torch.Tensor,
+        x1: Optional[torch.Tensor] = None,
+        solver: str = "euler_shortcut",
+        sample_steps: int = 1,
+        sampling_schedule: str = "linear",
+        sampling_schedule_params: Optional[dict] = None,
+        use_ema: bool = True,
+        temperature: float = 1.0,
+        condition_cfg: Optional[Union[torch.Tensor, TensorDict]] = None,
+        mask_cfg: Optional[Union[torch.Tensor, TensorDict]] = None,
+        w_cfg: float = 0.0,
+        condition_cg: None = None,
+        w_cg: float = 0.0,
+        warm_start_reference: Optional[torch.Tensor] = None,
+        warm_start_forward_level: float = 0.3,
+        requires_grad: bool = False,
+        preserve_history: bool = False,
+        **kwargs,
+    ):
+        """Euler-like sampling with arbitrary step count.
+
+        For ``sample_steps = 1`` and a converged model this produces a true
+        one-step sample (``d ≈ 1``). For ``sample_steps = N`` the schedule
+        partitions ``[t_min, 1]`` into ``N`` intervals; each Euler step uses
+        ``d = t_curr − t_next``.
+
+        ``warm_start_reference`` enables MPC-style re-planning: the previous
+        plan is mixed with noise at level ``warm_start_forward_level`` and
+        used as the starting ``x1`` instead of pure noise.
+        """
+        assert solver in self.supported_solvers, f"Solver {solver} is not supported."
+        assert w_cg == 0.0 and condition_cg is None, (
+            "Shortcut Flow Models do not support classifier-guidance."
+        )
+
+        n_samples = prior.shape[0]
+        log = {"sample_history": []}
+        model = self.model if not use_ema else self.model_ema
+
+        sampling_schedule_params = sampling_schedule_params or {}
+
+        prior = prior.to(self.device)
+        if isinstance(warm_start_reference, torch.Tensor) and 0.0 < warm_start_forward_level < 1.0:
+            warm_start_reference = warm_start_reference.to(self.device)
+            t_c = torch.ones_like(prior) * warm_start_forward_level
+            x1 = torch.randn_like(prior) * t_c + warm_start_reference * (1 - t_c)
+            start_t = float(warm_start_forward_level)
+        else:
+            if x1 is None:
+                x1 = torch.randn_like(prior) * temperature
+            else:
+                assert prior.shape == x1.shape, "prior and x1 must have the same shape"
+            start_t = 1.0
+
+        xt = x1
+        xt = xt * (1.0 - self.fix_mask) + prior * self.fix_mask
+        if preserve_history:
+            log["sample_history"].append(xt.cpu().numpy())
+
+        with torch.set_grad_enabled(requires_grad):
+            condition_vec_cfg = (
+                model["condition"](condition_cfg, mask_cfg) if condition_cfg is not None else None
+            )
+
+        sampling_scheduler = get_sampling_scheduler(sampling_schedule, **sampling_schedule_params)
+        t_schedule = sampling_scheduler(
+            sample_steps, device=self.device, **sampling_schedule_params
+        )
+        if start_t != 1.0:
+            t_schedule = t_schedule * start_t
+
+        for i in reversed(range(1, sample_steps + 1)):
+            t_curr = float(t_schedule[i].item())
+            t_next = float(t_schedule[i - 1].item())
+            d_val = t_curr - t_next  # positive
+
+            t = torch.full((n_samples,), t_curr, dtype=torch.float32, device=self.device)
+            d_tensor = torch.full((n_samples,), d_val, dtype=torch.float32, device=self.device)
+
+            with torch.set_grad_enabled(requires_grad):
+                if w_cfg == 1.0:
+                    vel = model["diffusion"](xt, t, condition_vec_cfg, d=d_tensor)
+                elif w_cfg == 0.0 or condition_vec_cfg is None:
+                    vel = model["diffusion"](xt, t, None, d=d_tensor)
+                else:
+                    condition = dict_apply(condition_vec_cfg, concat_zeros, dim=0)
+                    vel_all = model["diffusion"](
+                        einops.repeat(xt, "b ... -> (2 b) ..."),
+                        t.repeat(2),
+                        condition,
+                        d=d_tensor.repeat(2),
+                    )
+                    vel, vel_uncond = torch.chunk(vel_all, 2, dim=0)
+                    vel = w_cfg * vel + (1 - w_cfg) * vel_uncond
+
+            # Euler-like step toward data (decreasing t)
+            xt = xt + at_least_ndim(d_tensor, xt.dim()) * vel
+            xt = xt * (1.0 - self.fix_mask) + prior * self.fix_mask
+
+            if preserve_history:
+                log["sample_history"].append(xt.cpu().numpy())
+
+        if self.clip_pred:
+            xt = xt.clip(self.x_min, self.x_max)
+
+        log["t_schedule"] = t_schedule
+        return xt, log
+
+
+if __name__ == "__main__":
+    from cleandiffuser.nn_diffusion import DiT1dShortcut
+
+    nn_diffusion = DiT1dShortcut(
+        x_dim=11, x_seq_len=32, emb_dim=64, d_model=128, n_heads=4, depth=2,
+        timestep_emb_type="untrainable_fourier", timestep_emb_params={"scale": 0.02},
+    )
+    flow = ContinuousShortcutFlow(nn_diffusion)
+    prior = torch.zeros((2, 32, 11))
+    x, _ = flow.sample(prior, sample_steps=1)
+    print("1-step sample:", x.shape)
+    x, _ = flow.sample(prior, sample_steps=4)
+    print("4-step sample:", x.shape)

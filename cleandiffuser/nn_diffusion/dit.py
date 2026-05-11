@@ -6,7 +6,7 @@ import torch.nn as nn
 from cleandiffuser.nn_diffusion import BaseNNDiffusion
 from cleandiffuser.utils import UntrainablePositionalEmbedding
 
-__all__ = ["DiT1d", "DiT1dWithACICrossAttention"]
+__all__ = ["DiT1d", "DiT1dWithACICrossAttention", "DiT1dShortcut"]
 
 
 def modulate(x, shift, scale):
@@ -389,6 +389,88 @@ class DiT1dWithACICrossAttention(DiT1d):
 
         x_emb = self.final_layer(x_emb, cond_emb)
 
+        return x_emb
+
+
+class DiT1dShortcut(DiT1d):
+    """DiT1d backbone augmented with a shortcut step-size input ``d``.
+
+    Used by ``ContinuousShortcutModel`` (Frans et al., 2024). The network
+    predicts the *average* velocity from ``t`` to ``t - d`` along the
+    linear interpolation path ``xt = (1-t)·x0 + t·ε``. When ``d=0`` this
+    reduces to standard flow-matching (instantaneous velocity).
+
+    The ``d`` embedding re-uses the same ``map_noise`` module that already
+    embeds the timestep ``t`` (Fourier or positional, configured at
+    construction time), followed by a separate two-layer projection MLP
+    whose final linear is zero-initialised so the network behaves like
+    the parent ``DiT1d`` at the start of training.
+
+    Args: same as ``DiT1d``.
+
+    Examples:
+        >>> model = DiT1dShortcut(x_dim=5, x_seq_len=10, emb_dim=16,
+        ...                       timestep_emb_type="untrainable_fourier")
+        >>> x = torch.randn((2, 10, 5))
+        >>> t = torch.rand((2,))
+        >>> d = torch.tensor([0.0, 0.5])
+        >>> condition = torch.randn((2, 16))
+        >>> model(x, t, condition, d=d).shape
+        torch.Size([2, 10, 5])
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        emb_dim = self.t_proj[0].in_features
+        d_model = self.t_proj[0].out_features
+        self.d_proj = nn.Sequential(
+            nn.Linear(emb_dim, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
+        )
+        nn.init.normal_(self.d_proj[0].weight, std=0.02)
+        # zero-init the last linear so d contributes nothing at init
+        nn.init.zeros_(self.d_proj[-1].weight)
+        nn.init.zeros_(self.d_proj[-1].bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        condition: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None,
+        d: Optional[Union[torch.Tensor, float]] = None,
+    ):
+        if isinstance(condition, dict):
+            vec_condition = condition.get("vec_condition", None)
+            seq_condition = condition.get("seq_condition", None)
+            seq_condition_mask = condition.get("seq_condition_mask", None)
+        else:
+            vec_condition = condition
+            seq_condition = None
+            seq_condition_mask = None
+
+        if d is None:
+            d_tensor = torch.zeros_like(t, dtype=t.dtype)
+        elif not isinstance(d, torch.Tensor):
+            d_tensor = torch.full_like(t, float(d), dtype=t.dtype)
+        elif d.ndim == 0:
+            d_tensor = d.expand_as(t).to(dtype=t.dtype)
+        else:
+            d_tensor = d.to(dtype=t.dtype)
+
+        t_emb = self.t_proj(self.map_noise(t))
+        d_emb = self.d_proj(self.map_noise(d_tensor))
+        x_emb = self.x_proj(x) + self.pos_emb
+
+        cond_emb = t_emb + d_emb
+        if vec_condition is not None:
+            cond_emb = cond_emb + self.cond_proj(vec_condition)
+
+        if seq_condition is not None and self.seq_cond_proj is not None:
+            seq_condition = self.seq_cond_proj(seq_condition)
+
+        for block in self.blocks:
+            x_emb = block(x_emb, cond_emb, seq_condition, seq_condition_mask)
+
+        x_emb = self.final_layer(x_emb, cond_emb)
         return x_emb
 
 

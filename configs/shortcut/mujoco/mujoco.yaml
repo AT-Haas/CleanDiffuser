@@ -1,0 +1,70 @@
+# Base config for Shortcut Flow on D4RL MuJoCo locomotion.
+# Per-environment overrides live in ./task/*.yaml and are selected by ``task=...``.
+
+defaults:
+  - _self_
+  - task: hopper-medium-v2
+
+pipeline_name: shortcut_d4rl_mujoco
+# training | inference
+mode: training
+seed: 0
+
+# Hardware
+devices: 1
+precision: 32-true                 # or "16-mixed" for AMP
+
+# Dataset / horizon
+horizon: 32
+discount: 0.99
+batch_size: 256
+invdyn_batch_size: 512
+num_workers: 4
+
+# Network architecture (DiT1dShortcut)
+emb_dim: 64
+d_model: 256
+n_heads: 4
+depth: 4
+next_obs_loss_weight: 10.0
+cfg_dropout: 0.25
+invdyn_hidden_dim: 256
+ema_rate: 0.9999
+
+# Shortcut-specific
+K_max: 7                           # d ∈ {2^-7, …, 2^0}
+fm_consistency_ratio: 0.75         # 75% FM + 25% self-consistency
+
+# Training
+lr: 3.0e-4
+diffusion_gradient_steps: 500000
+invdyn_gradient_steps: 500000
+log_interval: 1000
+save_interval: 100000
+enable_progress_bar: false
+
+# Evaluation
+sampling_steps: 1                  # one-step inference — the headline use case
+w_cfg: 1.2
+use_ema: true
+num_envs: 50
+num_episodes: 3
+eval_after_training: true
+
+# I/O
+save_dir: results
+
+# Inference-mode-only overrides (paths)
+load_planner_ckpt: null            # ← set when running mode=inference
+load_invdyn_ckpt:  null
+
+# W&B (off by default — flip on for sweeps)
+use_wandb: false
+wandb_project: cleandiffuser-shortcut
+
+# Hydra
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: outputs/${pipeline_name}/${task.env_name}/seed_${seed}

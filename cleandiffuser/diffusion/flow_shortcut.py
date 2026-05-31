@@ -136,7 +136,16 @@ class ContinuousShortcutFlow(DiffusionModel):
         x0: torch.Tensor,
         condition: Optional[Union[torch.Tensor, TensorDict]] = None,
         x1: Optional[torch.Tensor] = None,
+        return_components: bool = False,
     ):
+        """Hybrid flow-matching + self-consistency loss.
+
+        If ``return_components`` is True, returns ``(total_loss, components)`` where
+        ``components`` is ``{"loss_fm": <tensor>, "loss_sc": <tensor>}`` holding the
+        (detached) per-branch MSE means — useful for tracking the two objectives
+        separately during training/validation. The default (False) returns only the
+        combined scalar, so existing callers are unaffected.
+        """
         B = x0.shape[0]
         if x1 is None:
             x1 = torch.randn_like(x0)
@@ -154,6 +163,8 @@ class ContinuousShortcutFlow(DiffusionModel):
         B_sc = B - B_fm
 
         total_loss = x0.new_zeros(())
+        loss_fm = x0.new_zeros(())  # raw FM-branch MSE (for component logging)
+        loss_sc = x0.new_zeros(())  # raw SC-branch MSE (for component logging)
 
         # ---------- Flow-matching branch (d = 0) ----------
         if B_fm > 0:
@@ -205,6 +216,8 @@ class ContinuousShortcutFlow(DiffusionModel):
             loss_sc = ((pred_sc - target_sc) ** 2 * self.loss_weight * (1 - self.fix_mask)).mean()
             total_loss = total_loss + loss_sc * (B_sc / B)
 
+        if return_components:
+            return total_loss, {"loss_fm": loss_fm.detach(), "loss_sc": loss_sc.detach()}
         return total_loss
 
     def update_diffusion(
@@ -233,8 +246,10 @@ class ContinuousShortcutFlow(DiffusionModel):
         condition_cfg = batch.get("condition_cfg", None)
         x1 = batch.get("x1", None)
 
-        loss = self.loss(x0, condition_cfg, x1=x1)
+        loss, components = self.loss(x0, condition_cfg, x1=x1, return_components=True)
         self.log("diffusion_loss", loss, prog_bar=True)
+        self.log("fm_loss", components["loss_fm"], prog_bar=False)
+        self.log("sc_loss", components["loss_sc"], prog_bar=False)
 
         if self.ema_update_schedule(batch_idx):
             self.ema_update()

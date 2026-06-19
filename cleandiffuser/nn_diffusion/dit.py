@@ -6,7 +6,7 @@ import torch.nn as nn
 from cleandiffuser.nn_diffusion import BaseNNDiffusion
 from cleandiffuser.utils import UntrainablePositionalEmbedding
 
-__all__ = ["DiT1d", "DiT1dWithACICrossAttention", "DiT1dShortcut"]
+__all__ = ["DiT1d", "DiT1dWithACICrossAttention", "DiT1dShortcut", "DiT1dMeanFlow"]
 
 
 def modulate(x, shift, scale):
@@ -461,6 +461,87 @@ class DiT1dShortcut(DiT1d):
         x_emb = self.x_proj(x) + self.pos_emb
 
         cond_emb = t_emb + d_emb
+        if vec_condition is not None:
+            cond_emb = cond_emb + self.cond_proj(vec_condition)
+
+        if seq_condition is not None and self.seq_cond_proj is not None:
+            seq_condition = self.seq_cond_proj(seq_condition)
+
+        for block in self.blocks:
+            x_emb = block(x_emb, cond_emb, seq_condition, seq_condition_mask)
+
+        x_emb = self.final_layer(x_emb, cond_emb)
+        return x_emb
+
+
+class DiT1dMeanFlow(DiT1d):
+    """DiT1d backbone for MeanFlow (Geng et al., 2025, arXiv:2505.13447).
+
+    The network predicts the **average velocity** ``u(x, r, t)`` over the
+    interval ``[r, t]`` along the linear path ``xt = (1-t)·x0 + t·ε``. A second
+    time ``r`` is embedded through a separate zero-initialised ``r_proj`` MLP
+    (mirroring ``DiT1dShortcut``'s ``d_proj``), re-using the same ``map_noise``
+    module that embeds ``t``. With ``r = t`` (or ``r = None``) the interval
+    collapses and ``u`` reduces to the instantaneous flow-matching velocity, and
+    at initialisation (zero-init ``r_proj``) the network behaves like ``DiT1d``.
+
+    Trained with the MeanFlow identity ``u = v - (t-r)·du/dt`` (see
+    ``ContinuousMeanFlow``), whose ``du/dt`` is obtained by a JVP through this
+    network w.r.t. ``(x, r, t)`` with tangent ``(v, 0, 1)``. Keep dropout at 0
+    so the JVP is deterministic.
+
+    Args: same as ``DiT1d``.
+
+    Examples:
+        >>> model = DiT1dMeanFlow(x_dim=4, x_seq_len=8, emb_dim=16,
+        ...                       timestep_emb_type="untrainable_fourier")
+        >>> x = torch.randn((2, 8, 4)); t = torch.rand((2,)); r = torch.rand((2,)) * t
+        >>> model(x, t, None, r=r).shape
+        torch.Size([2, 8, 4])
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        emb_dim = self.t_proj[0].in_features
+        d_model = self.t_proj[0].out_features
+        self.r_proj = nn.Sequential(
+            nn.Linear(emb_dim, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
+        )
+        nn.init.normal_(self.r_proj[0].weight, std=0.02)
+        # zero-init the last linear so r contributes nothing at init (recovers DiT1d)
+        nn.init.zeros_(self.r_proj[-1].weight)
+        nn.init.zeros_(self.r_proj[-1].bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        condition: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None,
+        r: Optional[Union[torch.Tensor, float]] = None,
+    ):
+        if isinstance(condition, dict):
+            vec_condition = condition.get("vec_condition", None)
+            seq_condition = condition.get("seq_condition", None)
+            seq_condition_mask = condition.get("seq_condition_mask", None)
+        else:
+            vec_condition = condition
+            seq_condition = None
+            seq_condition_mask = None
+
+        if r is None:
+            r_tensor = t  # interval collapses → instantaneous velocity
+        elif not isinstance(r, torch.Tensor):
+            r_tensor = torch.full_like(t, float(r), dtype=t.dtype)
+        elif r.ndim == 0:
+            r_tensor = r.expand_as(t).to(dtype=t.dtype)
+        else:
+            r_tensor = r.to(dtype=t.dtype)
+
+        t_emb = self.t_proj(self.map_noise(t))
+        r_emb = self.r_proj(self.map_noise(r_tensor))
+        x_emb = self.x_proj(x) + self.pos_emb
+
+        cond_emb = t_emb + r_emb
         if vec_condition is not None:
             cond_emb = cond_emb + self.cond_proj(vec_condition)
 

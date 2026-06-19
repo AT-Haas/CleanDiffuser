@@ -88,6 +88,8 @@ class ContinuousShortcutFlow(DiffusionModel):
         x_min: Optional[torch.Tensor] = None,
         K_max: int = 7,
         fm_consistency_ratio: float = 0.75,
+        discrete_t: bool = False,
+        bootstrap_target: str = "ema",
     ):
         super().__init__(
             nn_diffusion,
@@ -101,9 +103,16 @@ class ContinuousShortcutFlow(DiffusionModel):
         assert classifier is None, "Shortcut Flow Models do not support classifier-guidance."
         assert 0.0 < fm_consistency_ratio < 1.0, "fm_consistency_ratio must be in (0, 1)."
         assert K_max >= 1, "K_max must be >= 1 (need at least d ∈ {1/2, 1})."
+        assert bootstrap_target in ("ema", "current")
 
         self.K_max = K_max
         self.fm_consistency_ratio = fm_consistency_ratio
+        # discrete_t: snap t to the dyadic grid of multiples of d (kvfrans original) so the
+        # self-consistency recursion telescopes exactly onto the N-step inference grid;
+        # continuous (default) samples t ~ U[d, 1]. bootstrap_target: "ema" (default, twin-EMA
+        # target) vs "current" (the live model under stop-grad, as in kvfrans).
+        self.discrete_t = discrete_t
+        self.bootstrap_target = bootstrap_target
 
         self.x_max = nn.Parameter(x_max, requires_grad=False) if x_max is not None else None
         self.x_min = nn.Parameter(x_min, requires_grad=False) if x_min is not None else None
@@ -193,8 +202,15 @@ class ContinuousShortcutFlow(DiffusionModel):
             )
             d_sc = 2.0 ** log2d  # ∈ {2^-K_max, …, 1}
 
-            # Sample t ~ U[d, 1] so the full d-step lands inside [0, 1].
-            t_sc = torch.rand((B_sc,), device=self.device) * (1 - d_sc) + d_sc
+            if self.discrete_t:
+                # Snap t to the dyadic grid {d, 2d, …, 1} (kvfrans original): the SC
+                # recursion then telescopes exactly onto the N-step inference grid.
+                n_sec = (1.0 / d_sc).round()
+                t_idx = (torch.rand((B_sc,), device=self.device) * n_sec).floor() + 1.0
+                t_sc = (t_idx * d_sc).clamp(max=1.0)
+            else:
+                # Continuous: t ~ U[d, 1] so the full d-step lands inside [0, 1].
+                t_sc = torch.rand((B_sc,), device=self.device) * (1 - d_sc) + d_sc
 
             xt_sc = x0_sc + at_least_ndim(t_sc, x0_sc.dim()) * (x1_sc - x0_sc)
             xt_sc = xt_sc * (1.0 - self.fix_mask) + x0_sc * self.fix_mask
@@ -202,14 +218,15 @@ class ContinuousShortcutFlow(DiffusionModel):
 
             d_half = d_sc / 2
 
+            target_model = self.model_ema if self.bootstrap_target == "ema" else self.model
             with torch.no_grad():
-                # First half-step (EMA backbone)
-                s1 = self.model_ema["diffusion"](xt_sc, t_sc, cond_sc, d=d_half)
+                # First half-step (target backbone)
+                s1 = target_model["diffusion"](xt_sc, t_sc, cond_sc, d=d_half)
                 x_mid = xt_sc + at_least_ndim(d_half, xt_sc.dim()) * s1
                 x_mid = x_mid * (1.0 - self.fix_mask) + x0_sc * self.fix_mask
-                # Second half-step (EMA backbone) at time t - d/2
+                # Second half-step (target backbone) at time t - d/2
                 t_mid = t_sc - d_half
-                s2 = self.model_ema["diffusion"](x_mid, t_mid, cond_sc, d=d_half)
+                s2 = target_model["diffusion"](x_mid, t_mid, cond_sc, d=d_half)
                 target_sc = (s1 + s2) / 2  # stop-grad target
 
             pred_sc = self.model["diffusion"](xt_sc, t_sc, cond_sc, d=d_sc)

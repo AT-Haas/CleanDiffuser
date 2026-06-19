@@ -512,12 +512,23 @@ class DiT1dMeanFlow(DiT1d):
         nn.init.zeros_(self.r_proj[-1].weight)
         nn.init.zeros_(self.r_proj[-1].bias)
 
+        # iMF (improved MeanFlow, arXiv:2512.02012): the CFG guidance scale ``w`` is an
+        # explicit conditioning input, so it can be varied at inference. Zero-init so a
+        # model trained without ``w`` (vanilla MeanFlow) is unaffected.
+        self.w_proj = nn.Sequential(
+            nn.Linear(emb_dim, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
+        )
+        nn.init.normal_(self.w_proj[0].weight, std=0.02)
+        nn.init.zeros_(self.w_proj[-1].weight)
+        nn.init.zeros_(self.w_proj[-1].bias)
+
     def forward(
         self,
         x: torch.Tensor,
         t: torch.Tensor,
         condition: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None,
         r: Optional[Union[torch.Tensor, float]] = None,
+        w: Optional[Union[torch.Tensor, float]] = None,
     ):
         if isinstance(condition, dict):
             vec_condition = condition.get("vec_condition", None)
@@ -542,6 +553,14 @@ class DiT1dMeanFlow(DiT1d):
         x_emb = self.x_proj(x) + self.pos_emb
 
         cond_emb = t_emb + r_emb
+        if w is not None:  # iMF: guidance scale as a conditioning input
+            if not isinstance(w, torch.Tensor):
+                w_tensor = torch.full_like(t, float(w), dtype=t.dtype)
+            elif w.ndim == 0:
+                w_tensor = w.expand_as(t).to(dtype=t.dtype)
+            else:
+                w_tensor = w.to(dtype=t.dtype)
+            cond_emb = cond_emb + self.w_proj(self.map_noise(w_tensor))
         if vec_condition is not None:
             cond_emb = cond_emb + self.cond_proj(vec_condition)
 

@@ -76,6 +76,9 @@ class ContinuousMeanFlow(DiffusionModel):
         cfg_omega: float = 1.0,
         cfg_kappa: float = 0.0,
         use_jvp: bool = True,
+        guided: bool = False,
+        w_min: float = 0.0,
+        w_max: float = 4.0,
     ):
         super().__init__(
             nn_diffusion,
@@ -96,6 +99,9 @@ class ContinuousMeanFlow(DiffusionModel):
         self.cfg_omega = cfg_omega
         self.cfg_kappa = cfg_kappa
         self.use_jvp = use_jvp
+        self.guided = guided  # iMF: condition on the guidance scale w (inference-time CFG)
+        self.w_min = w_min
+        self.w_max = w_max
 
         self.x_max = nn.Parameter(x_max, requires_grad=False) if x_max is not None else None
         self.x_min = nn.Parameter(x_min, requires_grad=False) if x_min is not None else None
@@ -142,8 +148,18 @@ class ContinuousMeanFlow(DiffusionModel):
         xt = xt * (1.0 - self.fix_mask) + x0 * self.fix_mask
         v = x0 - eps  # instantaneous data-ward velocity
 
-        # Effective (optionally CFG-tilted) velocity used in the identity.
-        if self.baked_cfg and cond_emb is not None:
+        # Effective (optionally CFG-tilted) velocity used in the identity, plus the
+        # iMF guidance-scale input ``w_in`` (None unless training the guided variant).
+        w_in = None
+        if self.guided and cond_emb is not None:
+            # iMF: condition on a sampled guidance scale w; regress u_w to the CFG-tilted
+            # velocity (1+w)·v_cond − w·v_uncond (uncond from the EMA net, stop-grad).
+            w_in = torch.rand((B,), device=self.device) * (self.w_max - self.w_min) + self.w_min
+            with torch.no_grad():
+                v_uncond = self.model_ema["diffusion"](xt, t, None, r=t, w=torch.zeros_like(t))
+            ww = at_least_ndim(w_in, v.dim())
+            v_eff = ((1.0 + ww) * v - ww * v_uncond).detach()
+        elif self.baked_cfg and cond_emb is not None:
             with torch.no_grad():
                 u_cond = self.model["diffusion"](xt, t, cond_emb, r=t)
                 u_uncond = self.model["diffusion"](xt, t, None, r=t)
@@ -158,7 +174,7 @@ class ContinuousMeanFlow(DiffusionModel):
         net = self.model["diffusion"]
 
         def fn(z, rr, tt):
-            return net(z, tt, cond_emb, r=rr)
+            return net(z, tt, cond_emb, r=rr, w=w_in)
 
         if self.use_jvp:
             u, dudt = torch.func.jvp(
@@ -276,7 +292,11 @@ class ContinuousMeanFlow(DiffusionModel):
             r = torch.full((n_samples,), t_next, dtype=torch.float32, device=self.device)
 
             with torch.set_grad_enabled(requires_grad):
-                if w_cfg == 1.0 or condition_vec_cfg is None:
+                if self.guided and condition_vec_cfg is not None:
+                    # iMF: one forward; w_cfg is the textbook guidance strength (0 = unguided)
+                    w_in = torch.full((n_samples,), float(w_cfg), dtype=torch.float32, device=self.device)
+                    vel = model["diffusion"](xt, t, condition_vec_cfg, r=r, w=w_in)
+                elif w_cfg == 1.0 or condition_vec_cfg is None:
                     vel = model["diffusion"](xt, t, condition_vec_cfg, r=r)
                 elif w_cfg == 0.0:
                     vel = model["diffusion"](xt, t, None, r=r)

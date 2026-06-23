@@ -27,9 +27,10 @@ class ContinuousMeanFlow(DiffusionModel):
 
         u(z, r, t) = v(z, t) − (t − r) · d/dt u(z, r, t)
 
-    where the total time-derivative ``du/dt`` (along the flow ``dz/dt = v``) is
+    where the total time-derivative ``du/dt`` (along the forward path, whose
+    geometric velocity is ``dz/dt = ε − x0 = −v`` in our data-ward convention) is
     obtained by a forward-mode JVP through the network w.r.t. ``(z, r, t)`` with
-    tangent ``(v, 0, 1)`` (``torch.func.jvp``). The regression target
+    tangent ``(−v, 0, 1)`` (``torch.func.jvp``). The regression target
     ``(v − (t−r)·du/dt)`` is stop-gradient'd; loss is an adaptively-weighted MSE
     ``1/(mse+ε)^p`` (Geng et al. §4). When ``r = t`` the identity collapses to
     plain flow matching (``u = v``), so a fraction of each batch is trained with
@@ -176,15 +177,22 @@ class ContinuousMeanFlow(DiffusionModel):
         def fn(z, rr, tt):
             return net(z, tt, cond_emb, r=rr, w=w_in)
 
+        # The MeanFlow identity needs du/dt = ∂_t u + ∂_z u · (dz/dt), the TOTAL
+        # derivative along the forward path z_t = (1-t)x0 + t·ε. The geometric flow
+        # velocity is dz/dt = ε − x0 = −v_eff (our data-ward convention defines
+        # v_eff = x0 − ε), so the JVP z-tangent is −v_eff, NOT v_eff. The regression
+        # `target` below still uses the data-ward v_eff. (See validate_meanflow.py's
+        # JVP-vs-finite-difference check.)
+        dz_dt = -v_eff
         if self.use_jvp:
             u, dudt = torch.func.jvp(
-                fn, (xt, r, t), (v_eff, torch.zeros_like(r), torch.ones_like(t))
+                fn, (xt, r, t), (dz_dt, torch.zeros_like(r), torch.ones_like(t))
             )
         else:
-            # finite-difference du/dt along (dz=v_eff, dr=0, dt=1)
+            # finite-difference du/dt along (dz=dz_dt, dr=0, dt=1)
             h = 1e-3
             u = fn(xt, r, t)
-            u_h = fn(xt + h * v_eff, r, t + h)
+            u_h = fn(xt + h * dz_dt, r, t + h)
             dudt = (u_h - u) / h
 
         target = (v_eff - at_least_ndim(t - r, v_eff.dim()) * dudt).detach()

@@ -34,7 +34,8 @@ class ContinuousShortcutFlow(DiffusionModel):
     matching (instantaneous velocity ``v* = x0 − ε``). When ``d > 0`` it
     predicts the chord velocity of a finite jump of size ``d``.
 
-    Training uses a hybrid objective on each batch (paper default 75/25):
+    Training uses a hybrid objective on each batch (kvfrans default 87.5/12.5,
+    i.e. ``bootstrap_every=8``):
 
       * **Flow matching** (``d = 0``, ``fm_consistency_ratio`` of the batch):
         ``loss_fm = ||s_θ(xt, t, 0, c) − (x0 − ε)||²``
@@ -72,7 +73,7 @@ class ContinuousShortcutFlow(DiffusionModel):
             schedule (``d ∈ {2^-K_max, …, 2^0}``). Default 7 ⇒ 1/128 … 1.
         fm_consistency_ratio (float): Fraction of each batch trained with
             ``d = 0`` (pure flow matching). The rest is trained with the
-            self-consistency loss. Default 0.75.
+            self-consistency loss. Default 0.875 (kvfrans ``bootstrap_every=8``).
     """
 
     def __init__(
@@ -82,12 +83,12 @@ class ContinuousShortcutFlow(DiffusionModel):
         fix_mask: Optional[torch.Tensor] = None,
         loss_weight: Optional[torch.Tensor] = None,
         classifier: Optional[BaseClassifier] = None,
-        ema_rate: float = 0.9999,
+        ema_rate: float = 0.999,
         optimizer_params: Optional[dict] = None,
         x_max: Optional[torch.Tensor] = None,
         x_min: Optional[torch.Tensor] = None,
         K_max: int = 7,
-        fm_consistency_ratio: float = 0.75,
+        fm_consistency_ratio: float = 0.875,
         discrete_t: bool = False,
         bootstrap_target: str = "ema",
     ):

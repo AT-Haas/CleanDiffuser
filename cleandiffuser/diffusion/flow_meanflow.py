@@ -57,6 +57,15 @@ class ContinuousMeanFlow(DiffusionModel):
         cfg_omega, cfg_kappa (float): baked-CFG mix (``ω=1, κ=0`` ⇒ unguided).
         use_jvp (bool): JVP via ``torch.func.jvp`` (default) or a finite-
             difference ``du/dt`` fallback if the JVP is unavailable.
+        imf_vloss (bool): iMF *v-loss* reparameterisation (arXiv:2512.02012).
+            When ``False`` (default) the JVP z-tangent is the conditional/CFG
+            velocity ``−v_eff`` (= original MeanFlow). When ``True`` it is the
+            model's own instantaneous velocity ``−v_θ = −u_θ(z,t,t)`` (boundary
+            condition, stop-grad), which makes the regression target network-
+            independent (lower-variance, more stable) at the cost of one extra
+            forward per ``r<t`` step. With the JVP stop-grad'd the two share the
+            same ``target``/gradient *except* for this tangent. Inference is
+            identical either way. Default ``False`` (compute-cheap baseline).
     """
 
     def __init__(
@@ -77,6 +86,7 @@ class ContinuousMeanFlow(DiffusionModel):
         cfg_omega: float = 1.0,
         cfg_kappa: float = 0.0,
         use_jvp: bool = True,
+        imf_vloss: bool = False,
         guided: bool = False,
         w_min: float = 0.0,
         w_max: float = 4.0,
@@ -100,6 +110,7 @@ class ContinuousMeanFlow(DiffusionModel):
         self.cfg_omega = cfg_omega
         self.cfg_kappa = cfg_kappa
         self.use_jvp = use_jvp
+        self.imf_vloss = imf_vloss  # iMF v-loss: JVP tangent = model's own velocity v_θ
         self.guided = guided  # iMF: condition on the guidance scale w (inference-time CFG)
         self.w_min = w_min
         self.w_max = w_max
@@ -179,11 +190,23 @@ class ContinuousMeanFlow(DiffusionModel):
 
         # The MeanFlow identity needs du/dt = ∂_t u + ∂_z u · (dz/dt), the TOTAL
         # derivative along the forward path z_t = (1-t)x0 + t·ε. The geometric flow
-        # velocity is dz/dt = ε − x0 = −v_eff (our data-ward convention defines
-        # v_eff = x0 − ε), so the JVP z-tangent is −v_eff, NOT v_eff. The regression
-        # `target` below still uses the data-ward v_eff. (See validate_meanflow.py's
-        # JVP-vs-finite-difference check.)
-        dz_dt = -v_eff
+        # velocity is dz/dt = ε − x0 = −(instantaneous velocity) (our data-ward
+        # convention defines v_eff = x0 − ε), so the JVP z-tangent is the *negated*
+        # instantaneous velocity. Two choices of that velocity:
+        #   • original MeanFlow (default): the conditional/CFG velocity v_eff (= ε−x
+        #     per sample) ⇒ tangent −v_eff.
+        #   • iMF v-loss (``imf_vloss``): the model's OWN instantaneous velocity
+        #     v_θ = u_θ(z,t,t) (boundary condition, stop-grad) ⇒ tangent −v_θ. This
+        #     makes the regression target network-independent (lower-variance, more
+        #     stable; arXiv:2512.02012) at the cost of one extra forward. With the JVP
+        #     stop-grad'd the two share the same `target`/gradient *except* for this
+        #     tangent (the `target` below still uses the data-ward v_eff either way).
+        # (See validate_meanflow.py's JVP-vs-finite-difference + tangent-variance checks.)
+        if self.imf_vloss:
+            v_theta = fn(xt, t, t).detach()  # u_θ(z,t,t): model's instantaneous velocity
+            dz_dt = -v_theta
+        else:
+            dz_dt = -v_eff
         if self.use_jvp:
             u, dudt = torch.func.jvp(
                 fn, (xt, r, t), (dz_dt, torch.zeros_like(r), torch.ones_like(t))

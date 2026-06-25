@@ -1,3 +1,14 @@
+"""1-D DiT backbones for trajectory diffusion/flow models.
+
+Upstream CleanDiffuser ``DiT1d`` (Peebles & Xie, "Scalable Diffusion Models with
+Transformers", arXiv:2212.09748) plus the two few-step heads this project adds, which
+embed an extra time input alongside ``t`` (zero-initialised, so an untrained extra input
+leaves the base model unchanged):
+  * ``DiT1dShortcut`` — adds the step size ``d`` for Shortcut Models (arXiv:2410.12557).
+  * ``DiT1dMeanFlow`` — adds the interval start ``r`` (and an optional iMF guidance scale
+    ``w``) for MeanFlow / iMF (arXiv:2505.13447, arXiv:2512.02012).
+"""
+
 from typing import Dict, Optional, Union
 
 import torch
@@ -406,6 +417,13 @@ class DiT1dShortcut(DiT1d):
     whose final linear is zero-initialised so the network behaves like
     the parent ``DiT1d`` at the start of training.
 
+    An optional guidance-scale input ``w`` (iSM "Intrinsic Guidance",
+    arXiv:2510.21250) is embedded through a second zero-init MLP ``w_proj``
+    (mirroring ``DiT1dMeanFlow``'s ``w``). When ``ContinuousShortcutFlow`` is
+    trained with ``guided=True`` this turns the CFG scale into an inference-time
+    input (no compounding over big jumps, no retraining per ``w``); when ``w`` is
+    ``None`` (vanilla Shortcut) it contributes nothing.
+
     Args: same as ``DiT1d``.
 
     Examples:
@@ -431,12 +449,24 @@ class DiT1dShortcut(DiT1d):
         nn.init.zeros_(self.d_proj[-1].weight)
         nn.init.zeros_(self.d_proj[-1].bias)
 
+        # iSM (Improved Shortcut Models, arXiv:2510.21250): "Intrinsic Guidance" makes the
+        # CFG scale ``w`` an explicit conditioning input so it can be varied at inference
+        # (no exponential compounding over big jumps, no retraining per w). Zero-init so a
+        # model trained without ``w`` (vanilla Shortcut) is unaffected. Mirrors DiT1dMeanFlow.
+        self.w_proj = nn.Sequential(
+            nn.Linear(emb_dim, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
+        )
+        nn.init.normal_(self.w_proj[0].weight, std=0.02)
+        nn.init.zeros_(self.w_proj[-1].weight)
+        nn.init.zeros_(self.w_proj[-1].bias)
+
     def forward(
         self,
         x: torch.Tensor,
         t: torch.Tensor,
         condition: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None,
         d: Optional[Union[torch.Tensor, float]] = None,
+        w: Optional[Union[torch.Tensor, float]] = None,
     ):
         if isinstance(condition, dict):
             vec_condition = condition.get("vec_condition", None)
@@ -461,6 +491,14 @@ class DiT1dShortcut(DiT1d):
         x_emb = self.x_proj(x) + self.pos_emb
 
         cond_emb = t_emb + d_emb
+        if w is not None:  # iSM Intrinsic Guidance: guidance scale as a conditioning input
+            if not isinstance(w, torch.Tensor):
+                w_tensor = torch.full_like(t, float(w), dtype=t.dtype)
+            elif w.ndim == 0:
+                w_tensor = w.expand_as(t).to(dtype=t.dtype)
+            else:
+                w_tensor = w.to(dtype=t.dtype)
+            cond_emb = cond_emb + self.w_proj(self.map_noise(w_tensor))
         if vec_condition is not None:
             cond_emb = cond_emb + self.cond_proj(vec_condition)
 

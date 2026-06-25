@@ -1,3 +1,12 @@
+"""Continuous-time Shortcut Flow backbone for the few-step planner.
+
+Implements ``ContinuousShortcutFlow`` (Frans et al., 2024, "One Step Diffusion via
+Shortcut Models", arXiv:2410.12557): one network predicts the *average* velocity of a
+finite jump of size ``d`` (``d=0`` ⇒ flow matching), trained with a flow-matching +
+EMA self-consistency objective so a single forward pass can span a whole ``t=1→0`` step.
+See the class docstring for the loss and ``planning/IMPLEMENTATION_PLAN.md`` for context.
+"""
+
 from typing import Optional, Union
 
 import einops
@@ -56,6 +65,18 @@ class ContinuousShortcutFlow(DiffusionModel):
     ``x_{t-d} = xt + d · s_θ(xt, t, d, c)``. Setting ``sample_steps = 1``
     yields true one-step generation (``d ≈ 1``).
 
+    **Intrinsic Guidance** (``guided=True``; iSM, arXiv:2510.21250): the CFG scale
+    ``w`` becomes an explicit network input (``DiT1dShortcut``'s ``w``), trained
+    across ``w ∈ [w_min, w_max]``, so guidance is applied once per forward pass and
+    can be varied at inference. This removes the original Shortcut restriction that
+    fixes ``w`` before training, and avoids the exponential *compounding* of a
+    post-hoc CFG blend over big jumps (iSM Prop. 1: a single large step compounds
+    the scale to ≈ ``w^log2(N)``). The FM branch (``d=0``) regresses
+    ``s_θ(xt,t,c,0,w)`` to ``(1+w)·v_cond − w·v_uncond`` (``v_uncond`` from the EMA
+    net at ``w=0``, stop-grad), and the self-consistency bootstrap is evaluated at
+    the *same* ``w``. ``sample(..., w=...)`` then does one guided forward per step
+    (no post-hoc blend). Mirrors the iMF w-conditioning in ``ContinuousMeanFlow``.
+
     Args:
         nn_diffusion (BaseNNDiffusion): Network that supports the extra ``d``
             kwarg in its ``forward`` (e.g. ``DiT1dShortcut``).
@@ -74,6 +95,10 @@ class ContinuousShortcutFlow(DiffusionModel):
         fm_consistency_ratio (float): Fraction of each batch trained with
             ``d = 0`` (pure flow matching). The rest is trained with the
             self-consistency loss. Default 0.875 (kvfrans ``bootstrap_every=8``).
+        guided (bool): Enable iSM Intrinsic Guidance (``w`` as a conditioning
+            input). Default False (vanilla Shortcut; ``w`` ignored everywhere).
+        w_min, w_max (float): Range the guidance scale ``w`` is sampled from
+            during guided training. Default ``[0, 4]``.
     """
 
     def __init__(
@@ -91,6 +116,9 @@ class ContinuousShortcutFlow(DiffusionModel):
         fm_consistency_ratio: float = 0.875,
         discrete_t: bool = False,
         bootstrap_target: str = "ema",
+        guided: bool = False,
+        w_min: float = 0.0,
+        w_max: float = 4.0,
     ):
         super().__init__(
             nn_diffusion,
@@ -114,6 +142,10 @@ class ContinuousShortcutFlow(DiffusionModel):
         # target) vs "current" (the live model under stop-grad, as in kvfrans).
         self.discrete_t = discrete_t
         self.bootstrap_target = bootstrap_target
+        # iSM Intrinsic Guidance: condition on the guidance scale w (inference-time CFG).
+        self.guided = guided
+        self.w_min = w_min
+        self.w_max = w_max
 
         self.x_max = nn.Parameter(x_max, requires_grad=False) if x_max is not None else None
         self.x_min = nn.Parameter(x_min, requires_grad=False) if x_min is not None else None
@@ -186,8 +218,21 @@ class ContinuousShortcutFlow(DiffusionModel):
             d_fm = torch.zeros((B_fm,), device=self.device)
             cond_fm = cond_emb[:B_fm] if cond_emb is not None else None
 
-            target_fm = x0_fm - x1_fm  # data-ward velocity (constant along the straight path)
-            pred_fm = self.model["diffusion"](xt_fm, t_fm, cond_fm, d=d_fm)
+            v_fm = x0_fm - x1_fm  # data-ward velocity (constant along the straight path)
+            w_fm = None
+            if self.guided and cond_fm is not None:
+                # iSM Intrinsic Guidance: regress s_θ(xt,t,c,0,w) to the CFG-tilted velocity
+                # (1+w)·v_cond − w·v_uncond (v_uncond from the EMA net at w=0, stop-grad).
+                w_fm = torch.rand((B_fm,), device=self.device) * (self.w_max - self.w_min) + self.w_min
+                with torch.no_grad():
+                    v_uncond = self.model_ema["diffusion"](
+                        xt_fm, t_fm, None, d=d_fm, w=torch.zeros_like(t_fm)
+                    )
+                ww = at_least_ndim(w_fm, v_fm.dim())
+                target_fm = ((1.0 + ww) * v_fm - ww * v_uncond).detach()
+            else:
+                target_fm = v_fm
+            pred_fm = self.model["diffusion"](xt_fm, t_fm, cond_fm, d=d_fm, w=w_fm)
             loss_fm = ((pred_fm - target_fm) ** 2 * self.loss_weight * (1 - self.fix_mask)).mean()
             total_loss = total_loss + loss_fm * (B_fm / B)
 
@@ -219,18 +264,25 @@ class ContinuousShortcutFlow(DiffusionModel):
 
             d_half = d_sc / 2
 
+            # iSM: the self-consistency bootstrap is evaluated at a single sampled w,
+            # threaded through both half-steps AND the full d-step, so consistency holds
+            # for the guided velocity field at every w (w=None ⇒ vanilla, w ignored).
+            w_sc = None
+            if self.guided and cond_sc is not None:
+                w_sc = torch.rand((B_sc,), device=self.device) * (self.w_max - self.w_min) + self.w_min
+
             target_model = self.model_ema if self.bootstrap_target == "ema" else self.model
             with torch.no_grad():
                 # First half-step (target backbone)
-                s1 = target_model["diffusion"](xt_sc, t_sc, cond_sc, d=d_half)
+                s1 = target_model["diffusion"](xt_sc, t_sc, cond_sc, d=d_half, w=w_sc)
                 x_mid = xt_sc + at_least_ndim(d_half, xt_sc.dim()) * s1
                 x_mid = x_mid * (1.0 - self.fix_mask) + x0_sc * self.fix_mask
                 # Second half-step (target backbone) at time t - d/2
                 t_mid = t_sc - d_half
-                s2 = target_model["diffusion"](x_mid, t_mid, cond_sc, d=d_half)
+                s2 = target_model["diffusion"](x_mid, t_mid, cond_sc, d=d_half, w=w_sc)
                 target_sc = (s1 + s2) / 2  # stop-grad target
 
-            pred_sc = self.model["diffusion"](xt_sc, t_sc, cond_sc, d=d_sc)
+            pred_sc = self.model["diffusion"](xt_sc, t_sc, cond_sc, d=d_sc, w=w_sc)
             loss_sc = ((pred_sc - target_sc) ** 2 * self.loss_weight * (1 - self.fix_mask)).mean()
             total_loss = total_loss + loss_sc * (B_sc / B)
 
@@ -246,6 +298,20 @@ class ContinuousShortcutFlow(DiffusionModel):
         x1: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        """Run one optimizer step on the diffusion network (thin override of the base
+        ``DiffusionModel.update_diffusion`` that forwards the optional fixed noise ``x1``).
+
+        Args:
+            x0: Clean data batch ``(B, *x_shape)`` — the ``t=0`` endpoint.
+            condition_cfg: CFG conditioning input, or ``None`` for the unconditional model.
+            update_ema: If ``True``, update the EMA weights after the gradient step.
+            x1: Optional fixed source/noise sample ``(B, *x_shape)``; drawn from a
+                standard normal when ``None``.
+            **kwargs: Accepted for base-class compatibility; ignored here.
+
+        Returns:
+            The base class's update result (the training loss / log dict).
+        """
         return super().update_diffusion(x0, condition_cfg, update_ema, x1=x1)
 
     def training_step(self, batch, batch_idx):
@@ -291,6 +357,7 @@ class ContinuousShortcutFlow(DiffusionModel):
         w_cfg: float = 0.0,
         condition_cg: None = None,
         w_cg: float = 0.0,
+        w: float = 0.0,
         warm_start_reference: Optional[torch.Tensor] = None,
         warm_start_forward_level: float = 0.3,
         requires_grad: bool = False,
@@ -303,6 +370,13 @@ class ContinuousShortcutFlow(DiffusionModel):
         one-step sample (``d ≈ 1``). For ``sample_steps = N`` the schedule
         partitions ``[t_min, 1]`` into ``N`` intervals; each Euler step uses
         ``d = t_curr − t_next``.
+
+        ``w`` is the **iSM Intrinsic Guidance** scale (only used when the model was
+        trained with ``guided=True``): each step is a single guided forward
+        ``s_θ(xt,t,c,d,w)`` (no post-hoc blend). Pass ``condition_cfg`` with ``w=0``
+        for the conditional field, ``w>0`` to guide, or ``condition_cfg=None`` (``w=0``)
+        for the unconditional field. ``w_cfg`` is the legacy post-hoc CFG blend used
+        only for the **unguided** model (and as a documented compounding baseline).
 
         ``warm_start_reference`` enables MPC-style re-planning: the previous
         plan is mixed with noise at level ``warm_start_forward_level`` and
@@ -358,7 +432,11 @@ class ContinuousShortcutFlow(DiffusionModel):
             d_tensor = torch.full((n_samples,), d_val, dtype=torch.float32, device=self.device)
 
             with torch.set_grad_enabled(requires_grad):
-                if w_cfg == 1.0:
+                if self.guided:
+                    # iSM Intrinsic Guidance: one guided forward with w as an input
+                    # (condition_vec_cfg=None & w=0 ⇒ unconditional; w>0 ⇒ guided).
+                    vel = model["diffusion"](xt, t, condition_vec_cfg, d=d_tensor, w=w)
+                elif w_cfg == 1.0:
                     vel = model["diffusion"](xt, t, condition_vec_cfg, d=d_tensor)
                 elif w_cfg == 0.0 or condition_vec_cfg is None:
                     vel = model["diffusion"](xt, t, None, d=d_tensor)

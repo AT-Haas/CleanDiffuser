@@ -1,3 +1,13 @@
+"""Continuous-time MeanFlow / improved-MeanFlow (iMF) backbone for the few-step planner.
+
+Implements ``ContinuousMeanFlow`` (Geng et al., 2025, "Mean Flows for One-step
+Generative Modeling", arXiv:2505.13447) plus the iMF guidance-as-conditioning and
+``imf_vloss`` reparameterisation (arXiv:2512.02012). A single network predicts the
+*average* velocity over ``[r, t]``, so one forward pass integrates a whole sampling
+step (``sample_steps=1`` ⇒ one-step generation). See the class docstring for the
+MeanFlow identity/loss and ``planning/IMPLEMENTATION_PLAN.md`` for project context.
+"""
+
 from typing import Optional, Union
 
 import einops
@@ -151,6 +161,21 @@ class ContinuousMeanFlow(DiffusionModel):
         x1: Optional[torch.Tensor] = None,
         return_components: bool = False,
     ):
+        """MeanFlow training loss on one batch (the MeanFlow identity with a JVP
+        ``du/dt`` term; see the class docstring and the ``imf_vloss`` note in ``loss``).
+
+        Args:
+            x0: Clean data batch ``(B, H, D)`` — the ``t=0`` endpoint of the path.
+            condition: Network conditioning (e.g. goal / return embedding input), or
+                ``None`` for the unconditional model.
+            x1: Optional fixed noise ``(B, H, D)`` — the ``t=1`` endpoint; a fresh
+                standard normal is drawn when ``None``.
+            return_components: If ``True``, also return a dict with the flow-matching
+                (``r=t``) and mean-flow (``r<t``) loss components for logging.
+
+        Returns:
+            The scalar loss, or ``(loss, components)`` when ``return_components`` is set.
+        """
         B = x0.shape[0]
         eps = torch.randn_like(x0) if x1 is None else x1
         cond_emb = self.model["condition"](condition) if condition is not None else None
@@ -235,6 +260,17 @@ class ContinuousMeanFlow(DiffusionModel):
         return total_loss
 
     def training_step(self, batch, batch_idx):
+        """One Lightning training step: compute the loss, log its FM/MF components,
+        and update the EMA weights on schedule.
+
+        Args:
+            batch: Dict with ``"x0"`` (required clean data) and optional
+                ``"condition_cfg"`` and ``"x1"`` (fixed noise).
+            batch_idx: Lightning batch index, used to gate the EMA update schedule.
+
+        Returns:
+            The scalar training loss (for the optimizer).
+        """
         assert isinstance(batch, dict) and "x0" in batch.keys()
         x0 = batch["x0"]
         condition_cfg = batch.get("condition_cfg", None)

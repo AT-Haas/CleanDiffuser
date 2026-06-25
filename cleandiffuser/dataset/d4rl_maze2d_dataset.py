@@ -1,3 +1,11 @@
+"""Maze2D goal-reaching dataset for the few-step planner (D4RL ``maze2d-*-v1``).
+
+Adds ``D4RLMaze2DDataset`` to CleanDiffuser: it chunks the offline transition stream
+into horizon-length windows (not crossing episode boundaries) and exposes the
+per-episode goal so the planner can be conditioned by goal-inpainting rather than
+return-CFG. See the class docstring for the item layout and a usage example.
+"""
+
 from typing import Dict
 
 import numpy as np
@@ -85,6 +93,8 @@ class D4RLMaze2DDataset(BaseDataset):
         self.indices = np.asarray(self.indices, dtype=np.int64)
 
     def get_normalizer(self):
+        """Return the fitted observation normalizer (a ``GaussianNormalizer`` over the
+        state dims), so the planner and inverse-dynamics model share the same scaling."""
         return self.normalizers["state"]
 
     def __len__(self):

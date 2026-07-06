@@ -146,7 +146,8 @@ class ContinuousShortcutFlow(DiffusionModel):
         self.guided = guided
         self.w_min = w_min
         self.w_max = w_max
-        # Optional external guidance-gradient hook ``(xt, t) -> ∇E`` (same shape as ``xt``). When set
+        # Optional external guidance-gradient hook ``(xt, t, cond) -> ∇E`` (same shape as ``xt``;
+        # ``cond`` is the raw condition slice or None — condition-free callbacks ignore it). When set
         # on a guided model it swaps the FM-branch CFG target for the *energy*-tilted target
         # ``v + w·[t/(1−t)]·∇E`` (iSM energy guidance; the SC bootstrap enforces its self-consistency
         # for free). ``None`` (default) ⇒ the CFG target is used and this path is byte-identical to the
@@ -234,7 +235,10 @@ class ContinuousShortcutFlow(DiffusionModel):
                 # free (target-agnostic). Gate the 1/(1−t) blow-up at the noise boundary (true tilt ~0
                 # there) and cap the per-sample correction norm (protects a never-exactly-zero ∇E).
                 w_fm = torch.rand((B_fm,), device=self.device) * (self.w_max - self.w_min) + self.w_min
-                gE = self.energy_grad_fn(xt_fm, t_fm)
+                # Hand the callback the raw condition slice too (per-sample goals on Maze2D;
+                # condition-free callbacks — e.g. the E1 toy's analytic ∇E — just ignore it).
+                cond_raw_fm = condition[:B_fm] if isinstance(condition, torch.Tensor) else None
+                gE = self.energy_grad_fn(xt_fm, t_fm, cond_raw_fm)
                 coef = torch.where((1.0 - t_fm) < 1e-3, torch.zeros_like(t_fm),
                                    w_fm * t_fm / (1.0 - t_fm))
                 corr = at_least_ndim(coef, gE.dim()) * gE

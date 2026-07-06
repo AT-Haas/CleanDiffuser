@@ -124,7 +124,8 @@ class ContinuousMeanFlow(DiffusionModel):
         self.guided = guided  # iMF: condition on the guidance scale w (inference-time CFG)
         self.w_min = w_min
         self.w_max = w_max
-        # Optional external guidance-gradient hook ``(xt, t) -> ∇E`` (same shape as ``xt``). When set
+        # Optional external guidance-gradient hook ``(xt, t, cond) -> ∇E`` (same shape as ``xt``;
+        # ``cond`` is the raw condition or None — condition-free callbacks ignore it). When set
         # on a guided model it swaps the CFG-tilted identity velocity for the *energy*-tilted
         # ``v + w·[t/(1−t)]·∇E`` (iMF energy guidance; the MeanFlow bootstrap enforces its
         # average-velocity self-consistency). ``None`` (default) ⇒ the CFG target is used and this path
@@ -201,7 +202,10 @@ class ContinuousMeanFlow(DiffusionModel):
             # w. w=0 ⇒ unguided q0, w=1 ⇒ exact p0 (analytic ∇E). Gate the noise boundary + cap the
             # per-sample correction norm (protects a never-exactly-zero learned ∇E).
             w_in = torch.rand((B,), device=self.device) * (self.w_max - self.w_min) + self.w_min
-            gE = self.energy_grad_fn(xt, t)
+            # Hand the callback the raw condition too (per-sample goals on Maze2D;
+            # condition-free callbacks — e.g. the E1 toy's analytic ∇E — just ignore it).
+            cond_raw = condition if isinstance(condition, torch.Tensor) else None
+            gE = self.energy_grad_fn(xt, t, cond_raw)
             coef = torch.where((1.0 - t) < 1e-3, torch.zeros_like(t), w_in * t / (1.0 - t))
             corr = at_least_ndim(coef, gE.dim()) * gE
             cn = corr.flatten(1).norm(dim=1)

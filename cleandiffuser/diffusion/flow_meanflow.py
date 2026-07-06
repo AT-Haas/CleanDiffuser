@@ -124,6 +124,12 @@ class ContinuousMeanFlow(DiffusionModel):
         self.guided = guided  # iMF: condition on the guidance scale w (inference-time CFG)
         self.w_min = w_min
         self.w_max = w_max
+        # Optional external guidance-gradient hook ``(xt, t) -> ∇E`` (same shape as ``xt``). When set
+        # on a guided model it swaps the CFG-tilted identity velocity for the *energy*-tilted
+        # ``v + w·[t/(1−t)]·∇E`` (iMF energy guidance; the MeanFlow bootstrap enforces its
+        # average-velocity self-consistency). ``None`` (default) ⇒ the CFG target is used and this path
+        # is byte-identical to the original iMF. Set by the driver (e.g. E1's ∇E) before training.
+        self.energy_grad_fn = None
 
         self.x_max = nn.Parameter(x_max, requires_grad=False) if x_max is not None else None
         self.x_min = nn.Parameter(x_min, requires_grad=False) if x_min is not None else None
@@ -188,7 +194,20 @@ class ContinuousMeanFlow(DiffusionModel):
         # Effective (optionally CFG-tilted) velocity used in the identity, plus the
         # iMF guidance-scale input ``w_in`` (None unless training the guided variant).
         w_in = None
-        if self.guided and cond_emb is not None:
+        if self.guided and self.energy_grad_fn is not None and cond_emb is not None:
+            # iMF energy guidance: the identity's instantaneous velocity becomes the ENERGY-tilted
+            # v + w·[t/(1−t)]·∇E (∇E = score_pt − score_qt analytic, or a learned CEP gradient), so the
+            # MeanFlow bootstrap enforces the average-velocity consistency of this field at the sampled
+            # w. w=0 ⇒ unguided q0, w=1 ⇒ exact p0 (analytic ∇E). Gate the noise boundary + cap the
+            # per-sample correction norm (protects a never-exactly-zero learned ∇E).
+            w_in = torch.rand((B,), device=self.device) * (self.w_max - self.w_min) + self.w_min
+            gE = self.energy_grad_fn(xt, t)
+            coef = torch.where((1.0 - t) < 1e-3, torch.zeros_like(t), w_in * t / (1.0 - t))
+            corr = at_least_ndim(coef, gE.dim()) * gE
+            cn = corr.flatten(1).norm(dim=1)
+            corr = corr * at_least_ndim(torch.clamp(50.0 / (cn + 1e-9), max=1.0), corr.dim())
+            v_eff = (v + corr).detach()
+        elif self.guided and cond_emb is not None:
             # iMF: condition on a sampled guidance scale w; regress u_w to the CFG-tilted
             # velocity (1+w)·v_cond − w·v_uncond (uncond from the EMA net, stop-grad).
             w_in = torch.rand((B,), device=self.device) * (self.w_max - self.w_min) + self.w_min

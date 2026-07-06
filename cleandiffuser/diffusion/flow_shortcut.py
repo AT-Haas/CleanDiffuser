@@ -146,6 +146,12 @@ class ContinuousShortcutFlow(DiffusionModel):
         self.guided = guided
         self.w_min = w_min
         self.w_max = w_max
+        # Optional external guidance-gradient hook ``(xt, t) -> ∇E`` (same shape as ``xt``). When set
+        # on a guided model it swaps the FM-branch CFG target for the *energy*-tilted target
+        # ``v + w·[t/(1−t)]·∇E`` (iSM energy guidance; the SC bootstrap enforces its self-consistency
+        # for free). ``None`` (default) ⇒ the CFG target is used and this path is byte-identical to the
+        # original iSM. Set by the driver (e.g. E1's analytic or learned-CEP ∇E) before training.
+        self.energy_grad_fn = None
 
         self.x_max = nn.Parameter(x_max, requires_grad=False) if x_max is not None else None
         self.x_min = nn.Parameter(x_min, requires_grad=False) if x_min is not None else None
@@ -220,7 +226,22 @@ class ContinuousShortcutFlow(DiffusionModel):
 
             v_fm = x0_fm - x1_fm  # data-ward velocity (constant along the straight path)
             w_fm = None
-            if self.guided and cond_fm is not None:
+            if self.guided and self.energy_grad_fn is not None and cond_fm is not None:
+                # iSM energy guidance: regress s_θ(xt,t,c,0,w) to the ENERGY-tilted velocity
+                # v + w·[t/(1−t)]·∇E (∇E = score_pt − score_qt analytic, or a learned CEP gradient).
+                # w=0 ⇒ unguided q0, w=1 ⇒ exact p0 (analytic ∇E). The SC branch threads the same w
+                # through its own half-/full-steps, so it enforces this field's self-consistency for
+                # free (target-agnostic). Gate the 1/(1−t) blow-up at the noise boundary (true tilt ~0
+                # there) and cap the per-sample correction norm (protects a never-exactly-zero ∇E).
+                w_fm = torch.rand((B_fm,), device=self.device) * (self.w_max - self.w_min) + self.w_min
+                gE = self.energy_grad_fn(xt_fm, t_fm)
+                coef = torch.where((1.0 - t_fm) < 1e-3, torch.zeros_like(t_fm),
+                                   w_fm * t_fm / (1.0 - t_fm))
+                corr = at_least_ndim(coef, gE.dim()) * gE
+                cn = corr.flatten(1).norm(dim=1)
+                corr = corr * at_least_ndim(torch.clamp(50.0 / (cn + 1e-9), max=1.0), corr.dim())
+                target_fm = (v_fm + corr).detach()
+            elif self.guided and cond_fm is not None:
                 # iSM Intrinsic Guidance: regress s_θ(xt,t,c,0,w) to the CFG-tilted velocity
                 # (1+w)·v_cond − w·v_uncond (v_uncond from the EMA net at w=0, stop-grad).
                 w_fm = torch.rand((B_fm,), device=self.device) * (self.w_max - self.w_min) + self.w_min

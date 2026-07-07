@@ -59,6 +59,24 @@ class ContinuousMeanFlow(DiffusionModel):
         variant (``guided=True`` + a ``w`` input on ``DiT1dMeanFlow``); the real
         GPU CFG runs use that, not the baked scale here.
 
+    Relation to the reference iMF (arXiv:2512.02012, github.com/Lyy-iiis/imeanflow) —
+    our ``guided=True`` is a documented **simplification**: the reference regresses to
+    ``v_t + (1−1/ω)(v_cond − v_uncond)`` with *live-net* cond/uncond legs, samples ω from a
+    power law on ``[1, 1+s_max]``, and additionally conditions on a guidance *interval*
+    ``[t_min, t_max]``; we use the standard CFG extrapolation ``(1+w)·v_t − w·v_uncond``
+    with the **EMA** net's ``(cond=None, w=0)`` leg, ``w ~ U[w_min, w_max]``, and no
+    interval input. ``imf_vloss`` keeps the reference's tangent (the w-conditioned
+    ``v_θ = u_θ(z,t,t,w)``) as a tangent swap — gradient-identical to the reference's
+    compound-predictor form since the swapped term is stop-grad.
+
+    Guidance-tilt placement (adjudicated in ``planning/code_review_2026-07.md``): the
+    CFG/energy tilt enters ``v_eff``, which feeds **both** the identity target and the
+    JVP z-tangent — the identity's ``du/dt`` is the total derivative *along the flow of
+    the field being learned*, so the tangent must be the tilted field's velocity. This
+    differs deliberately from ``ContinuousShortcutFlow`` (tilt on the d=0 FM target only,
+    with the target-agnostic SC bootstrap propagating it): each is the unique correct
+    port of its own objective, not an inconsistency.
+
     Args mirror ``ContinuousShortcutFlow`` plus:
         time_mu, time_sigma (float): logit-normal params for sampling ``(r, t)``.
         r_not_equal_t_ratio (float): fraction of the batch with ``r < t`` (the

@@ -52,7 +52,10 @@ class LearnableNoisePrior(nn.Module):
     hard categorical draw, so the mixture ``logits`` receive gradient only through :meth:`log_prob`
     (i.e. through the KL term), which is the intended behavior. ``E1`` is unconditional, so this is a
     *global* prior (no state conditioning); the D4RL extension conditions an analogous net on the
-    observation.
+    observation. Documented simplification vs the reference (``github.com/ku-dmlab/PG``): the paper's
+    prior is a **network-parameterized, observation-conditioned** tanh-squashed Gaussian; ours is a
+    static (mixture-)Gaussian over the flattened noise — here conditioning enters via inpainting
+    instead (see ``planning/code_review_2026-07.md`` N7).
 
     Args:
         dim: Dimensionality of the (flattened) initial-noise vector (E1 ring toy: ``2``).
@@ -222,7 +225,9 @@ def fit_prior_guidance(
         lr: Adam learning rate (shared by both optimizers).
         kl_estimator: KL estimator passed to :meth:`LearnableNoisePrior.kl_to_standard_normal`.
         coverage_mix: Fraction of the value-regression batch drawn from base ``N(0,I)`` (the rest from
-            the current prior), so ``V̄_φ`` covers both the reference and the shifted support.
+            the current prior), so ``V̄_φ`` covers both the reference and the shifted support. This mix
+            is our robustness addition — the reference (``ku-dmlab/PG``) regresses on current-prior
+            draws only (code_review_2026-07.md N7).
         tanh_squash: Squash the prior means (see :class:`LearnableNoisePrior`).
         mean_scale: Squash amplitude (used iff ``tanh_squash``).
         value_hidden: Latent-value MLP width.

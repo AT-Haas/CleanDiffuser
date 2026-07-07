@@ -525,8 +525,11 @@ class DiT1dMeanFlow(DiT1d):
 
     Trained with the MeanFlow identity ``u = v - (t-r)·du/dt`` (see
     ``ContinuousMeanFlow``), whose ``du/dt`` is obtained by a JVP through this
-    network w.r.t. ``(x, r, t)`` with tangent ``(v, 0, 1)``. Keep dropout at 0
-    so the JVP is deterministic.
+    network w.r.t. ``(x, r, t)`` with tangent ``(−v, 0, 1)`` — the z-tangent is
+    the *negated* data-ward velocity because the forward path's geometric flow
+    is ``dz/dt = ε − x0 = −v`` (see ``flow_meanflow.py`` and the JVP-vs-FD check
+    in ``experiments/validate_meanflow.py``). Keep dropout at 0 so the JVP is
+    deterministic.
 
     Args: same as ``DiT1d``.
 

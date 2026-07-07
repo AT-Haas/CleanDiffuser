@@ -77,6 +77,25 @@ class ContinuousShortcutFlow(DiffusionModel):
     the *same* ``w``. ``sample(..., w=...)`` then does one guided forward per step
     (no post-hoc blend). Mirrors the iMF w-conditioning in ``ContinuousMeanFlow``.
 
+    Guidance-tilt placement (adjudicated in ``planning/code_review_2026-07.md``): the
+    CFG/energy tilt enters **only the d=0 FM target** here — the SC bootstrap is
+    *target-agnostic* (it threads the sampled ``w`` through the target net's own half-
+    and full-steps), so whatever w-field the FM branch pins down at ``d=0`` is exactly
+    the field whose self-consistency the SC branch enforces at ``d>0``. This differs
+    deliberately from ``ContinuousMeanFlow`` (tilt on the whole identity incl. the JVP
+    tangent): each is the unique correct port of its own objective, not an inconsistency.
+
+    Faithfulness notes vs the reference (github.com/kvfrans/shortcut-models,
+    ``targets_shortcut.py``; details in ``planning/code_review_2026-07.md`` N1): our
+    SC branch trains LHS steps down to ``d=2^-K_max`` (the reference's smallest LHS
+    bootstrap ``d`` is one octave larger, with ``2^-7`` only as a target half-step, and
+    its FM branch uses a smallest-``d`` token where we use exact ``d=0`` — the paper's
+    §3 form); we do not clip bootstrap intermediates/targets to ``[-4, 4]`` (image-
+    domain stabilizer); with ``discrete_t=True`` our ``t ∈ {d, …, 1}`` grid is exactly
+    the reference's ``{0, d, …, 1−d}`` after the noise-end convention flip, and the
+    reference also ships an EMA-bootstrap option (``bootstrap_ema``), so the
+    continuous-t + EMA default here deviates only in the *default*, not in kind.
+
     Args:
         nn_diffusion (BaseNNDiffusion): Network that supports the extra ``d``
             kwarg in its ``forward`` (e.g. ``DiT1dShortcut``).

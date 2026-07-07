@@ -4,30 +4,25 @@ Implements ``ContinuousMeanFlow`` (Geng et al., 2025, "Mean Flows for One-step
 Generative Modeling", arXiv:2505.13447) plus the iMF guidance-as-conditioning and
 ``imf_vloss`` reparameterisation (arXiv:2512.02012). A single network predicts the
 *average* velocity over ``[r, t]``, so one forward pass integrates a whole sampling
-step (``sample_steps=1`` ⇒ one-step generation). See the class docstring for the
-MeanFlow identity/loss and ``planning/IMPLEMENTATION_PLAN.md`` for project context.
+step (``sample_steps=1`` ⇒ one-step generation). The forward process, guided-target
+tilts and Euler sampling scaffold live in ``ContinuousFlowMap`` (``flow_map.py``); this
+class contributes the JVP MeanFlow-identity loss and the ``r``-spanned per-step velocity.
+See the class docstring for the identity and ``planning/IMPLEMENTATION_PLAN.md`` for context.
 """
 
 from typing import Optional, Union
 
 import einops
 import torch
-import torch.nn as nn
 
 from cleandiffuser.classifier import BaseClassifier
-from cleandiffuser.diffusion.basic import DiffusionModel
+from cleandiffuser.diffusion.flow_map import ContinuousFlowMap
 from cleandiffuser.nn_condition import BaseNNCondition
 from cleandiffuser.nn_diffusion import BaseNNDiffusion
-from cleandiffuser.utils import (
-    TensorDict,
-    at_least_ndim,
-    concat_zeros,
-    dict_apply,
-    get_sampling_scheduler,
-)
+from cleandiffuser.utils import TensorDict, at_least_ndim, concat_zeros, dict_apply
 
 
-class ContinuousMeanFlow(DiffusionModel):
+class ContinuousMeanFlow(ContinuousFlowMap):
     """Continuous-time MeanFlow model (Geng et al., 2025, arXiv:2505.13447).
 
     A single network ``u_θ(xt, r, t, c)`` predicts the **average velocity** over
@@ -125,15 +120,10 @@ class ContinuousMeanFlow(DiffusionModel):
         w_max: float = 4.0,
     ):
         super().__init__(
-            nn_diffusion,
-            nn_condition,
-            fix_mask,
-            loss_weight,
-            classifier,
-            ema_rate,
-            optimizer_params,
+            nn_diffusion, nn_condition, fix_mask, loss_weight, classifier,
+            ema_rate, optimizer_params, x_max=x_max, x_min=x_min,
+            guided=guided, w_min=w_min, w_max=w_max,
         )
-        assert classifier is None, "MeanFlow does not support classifier-guidance."
         assert 0.0 < r_not_equal_t_ratio <= 1.0
 
         self.time_mu = time_mu
@@ -144,27 +134,10 @@ class ContinuousMeanFlow(DiffusionModel):
         self.cfg_kappa = cfg_kappa
         self.use_jvp = use_jvp
         self.imf_vloss = imf_vloss  # iMF v-loss: JVP tangent = model's own velocity v_θ
-        self.guided = guided  # iMF: condition on the guidance scale w (inference-time CFG)
-        self.w_min = w_min
-        self.w_max = w_max
-        # Optional external guidance-gradient hook ``(xt, t, cond) -> ∇E`` (same shape as ``xt``;
-        # ``cond`` is the raw condition or None — condition-free callbacks ignore it). When set
-        # on a guided model it swaps the CFG-tilted identity velocity for the *energy*-tilted
-        # ``v + w·[t/(1−t)]·∇E`` (iMF energy guidance; the MeanFlow bootstrap enforces its
-        # average-velocity self-consistency). ``None`` (default) ⇒ the CFG target is used and this path
-        # is byte-identical to the original iMF. Set by the driver (e.g. E1's ∇E) before training.
-        self.energy_grad_fn = None
-
-        self.x_max = nn.Parameter(x_max, requires_grad=False) if x_max is not None else None
-        self.x_min = nn.Parameter(x_min, requires_grad=False) if x_min is not None else None
 
     @property
     def supported_solvers(self):
         return ["euler_meanflow"]
-
-    @property
-    def clip_pred(self):
-        return (self.x_max is not None) or (self.x_min is not None)
 
     @property
     def baked_cfg(self):
@@ -219,29 +192,21 @@ class ContinuousMeanFlow(DiffusionModel):
         # iMF guidance-scale input ``w_in`` (None unless training the guided variant).
         w_in = None
         if self.guided and self.energy_grad_fn is not None and cond_emb is not None:
-            # iMF energy guidance: the identity's instantaneous velocity becomes the ENERGY-tilted
-            # v + w·[t/(1−t)]·∇E (∇E = score_pt − score_qt analytic, or a learned CEP gradient), so the
-            # MeanFlow bootstrap enforces the average-velocity consistency of this field at the sampled
-            # w. w=0 ⇒ unguided q0, w=1 ⇒ exact p0 (analytic ∇E). Gate the noise boundary + cap the
-            # per-sample correction norm (protects a never-exactly-zero learned ∇E).
-            w_in = torch.rand((B,), device=self.device) * (self.w_max - self.w_min) + self.w_min
+            # iMF energy guidance: the identity's instantaneous velocity becomes the
+            # ENERGY-tilted v + w·[t/(1−t)]·∇E (∇E = score_pt − score_qt analytic, or a
+            # learned CEP gradient), so the MeanFlow bootstrap enforces the average-velocity
+            # consistency of this field at the sampled w. w=0 ⇒ unguided q0, w=1 ⇒ exact p0
+            # (analytic ∇E). Gate/cap: _energy_tilt.
+            w_in = self._sample_w(B)
             # Hand the callback the raw condition too (per-sample goals on Maze2D;
             # condition-free callbacks — e.g. the E1 toy's analytic ∇E — just ignore it).
             cond_raw = condition if isinstance(condition, torch.Tensor) else None
-            gE = self.energy_grad_fn(xt, t, cond_raw)
-            coef = torch.where((1.0 - t) < 1e-3, torch.zeros_like(t), w_in * t / (1.0 - t))
-            corr = at_least_ndim(coef, gE.dim()) * gE
-            cn = corr.flatten(1).norm(dim=1)
-            corr = corr * at_least_ndim(torch.clamp(50.0 / (cn + 1e-9), max=1.0), corr.dim())
-            v_eff = (v + corr).detach()
+            v_eff = self._energy_tilt(xt, t, v, w_in, cond_raw)
         elif self.guided and cond_emb is not None:
             # iMF: condition on a sampled guidance scale w; regress u_w to the CFG-tilted
             # velocity (1+w)·v_cond − w·v_uncond (uncond from the EMA net, stop-grad).
-            w_in = torch.rand((B,), device=self.device) * (self.w_max - self.w_min) + self.w_min
-            with torch.no_grad():
-                v_uncond = self.model_ema["diffusion"](xt, t, None, r=t, w=torch.zeros_like(t))
-            ww = at_least_ndim(w_in, v.dim())
-            v_eff = ((1.0 + ww) * v - ww * v_uncond).detach()
+            w_in = self._sample_w(B)
+            v_eff = self._cfg_tilt(xt, t, v, w_in, r=t)
         elif self.baked_cfg and cond_emb is not None:
             with torch.no_grad():
                 u_cond = self.model["diffusion"](xt, t, cond_emb, r=t)
@@ -310,9 +275,8 @@ class ContinuousMeanFlow(DiffusionModel):
         and update the EMA weights on schedule.
 
         Args:
-            batch: Dict with ``"x0"`` (required clean data) and optional
-                ``"condition_cfg"`` and ``"x1"`` (fixed noise).
-            batch_idx: Lightning batch index, used to gate the EMA update schedule.
+            batch: Dict with ``x0`` (required), ``condition_cfg`` / ``x1`` (optional).
+            batch_idx: Lightning batch index (drives the EMA update schedule).
 
         Returns:
             The scalar training loss (for the optimizer).
@@ -333,122 +297,33 @@ class ContinuousMeanFlow(DiffusionModel):
 
     # ==================== Sampling ======================
 
-    def sample(
-        self,
-        prior: torch.Tensor,
-        x1: Optional[torch.Tensor] = None,
-        solver: str = "euler_meanflow",
-        sample_steps: int = 1,
-        sampling_schedule: str = "linear",
-        sampling_schedule_params: Optional[dict] = None,
-        use_ema: bool = True,
-        temperature: float = 1.0,
-        condition_cfg: Optional[Union[torch.Tensor, TensorDict]] = None,
-        mask_cfg: Optional[Union[torch.Tensor, TensorDict]] = None,
-        w_cfg: float = 1.0,
-        condition_cg: None = None,
-        w_cg: float = 0.0,
-        warm_start_reference: Optional[torch.Tensor] = None,
-        warm_start_forward_level: float = 0.3,
-        requires_grad: bool = False,
-        preserve_history: bool = False,
-        **kwargs,
-    ):
-        """Euler sampling of the average-velocity field from ``t=1`` to ``t=0``.
+    def _default_w_cfg(self) -> float:
+        return 1.0
 
-        Each step integrates the whole interval ``[t_next, t_curr]`` in one call:
-        ``x ← x + (t_curr − t_next) · u(x, r=t_next, t=t_curr, c)``. For vanilla
-        MeanFlow guidance is *baked* (use ``w_cfg=1``); a post-hoc CFG blend is
-        still available for ``w_cfg ∉ {0, 1}`` for experimentation.
+    def _step_velocity(self, model, xt, t, t_curr, t_next, condition_vec_cfg, w, w_cfg):
+        """MeanFlow per-step velocity: one forward integrating ``[t_next, t_curr]`` via
+        ``r = t_next``.
+
+        Guided (iMF) models do a single forward with ``w_cfg`` as the textbook guidance
+        strength (0 = unguided; dedicated ``w`` kwarg lands with the API alignment);
+        unguided models use the plain conditional/unconditional forward or, for
+        ``w_cfg ∉ {0, 1}``, the legacy double-batch post-hoc CFG blend.
         """
-        assert solver in self.supported_solvers, f"Solver {solver} is not supported."
-        assert w_cg == 0.0 and condition_cg is None, "MeanFlow does not support classifier-guidance."
-
-        n_samples = prior.shape[0]
-        log = {"sample_history": []}
-        model = self.model if not use_ema else self.model_ema
-        sampling_schedule_params = sampling_schedule_params or {}
-
-        prior = prior.to(self.device)
-        if isinstance(warm_start_reference, torch.Tensor) and 0.0 < warm_start_forward_level < 1.0:
-            warm_start_reference = warm_start_reference.to(self.device)
-            t_c = torch.ones_like(prior) * warm_start_forward_level
-            x1 = torch.randn_like(prior) * t_c + warm_start_reference * (1 - t_c)
-            start_t = float(warm_start_forward_level)
-        else:
-            if x1 is None:
-                x1 = torch.randn_like(prior) * temperature
-            else:
-                assert prior.shape == x1.shape
-            start_t = 1.0
-
-        xt = x1 * (1.0 - self.fix_mask) + prior * self.fix_mask
-        if preserve_history:
-            log["sample_history"].append(xt.cpu().numpy())
-
-        with torch.set_grad_enabled(requires_grad):
-            condition_vec_cfg = (
-                model["condition"](condition_cfg, mask_cfg) if condition_cfg is not None else None
-            )
-
-        sampling_scheduler = get_sampling_scheduler(sampling_schedule, **sampling_schedule_params)
-        t_schedule = sampling_scheduler(sample_steps, device=self.device, **sampling_schedule_params)
-        if start_t != 1.0:
-            t_schedule = t_schedule * start_t
-
-        for i in reversed(range(1, sample_steps + 1)):
-            t_curr = float(t_schedule[i].item())
-            t_next = float(t_schedule[i - 1].item())
-            d_val = t_curr - t_next  # positive interval length
-
-            t = torch.full((n_samples,), t_curr, dtype=torch.float32, device=self.device)
-            r = torch.full((n_samples,), t_next, dtype=torch.float32, device=self.device)
-
-            with torch.set_grad_enabled(requires_grad):
-                if self.guided and condition_vec_cfg is not None:
-                    # iMF: one forward; w_cfg is the textbook guidance strength (0 = unguided)
-                    w_in = torch.full((n_samples,), float(w_cfg), dtype=torch.float32, device=self.device)
-                    vel = model["diffusion"](xt, t, condition_vec_cfg, r=r, w=w_in)
-                elif w_cfg == 1.0 or condition_vec_cfg is None:
-                    vel = model["diffusion"](xt, t, condition_vec_cfg, r=r)
-                elif w_cfg == 0.0:
-                    vel = model["diffusion"](xt, t, None, r=r)
-                else:
-                    condition = dict_apply(condition_vec_cfg, concat_zeros, dim=0)
-                    vel_all = model["diffusion"](
-                        einops.repeat(xt, "b ... -> (2 b) ..."),
-                        t.repeat(2),
-                        condition,
-                        r=r.repeat(2),
-                    )
-                    vel, vel_uncond = torch.chunk(vel_all, 2, dim=0)
-                    vel = w_cfg * vel + (1 - w_cfg) * vel_uncond
-
-            xt = xt + d_val * vel
-            xt = xt * (1.0 - self.fix_mask) + prior * self.fix_mask
-            if preserve_history:
-                log["sample_history"].append(xt.cpu().numpy())
-
-        if self.clip_pred:
-            xt = xt.clip(self.x_min, self.x_max)
-
-        log["t_schedule"] = t_schedule
-        return xt, log
-
-
-if __name__ == "__main__":
-    from cleandiffuser.nn_diffusion import DiT1dMeanFlow
-
-    nn_diffusion = DiT1dMeanFlow(
-        x_dim=4, x_seq_len=8, emb_dim=64, d_model=128, n_heads=4, depth=2,
-        timestep_emb_type="untrainable_fourier", timestep_emb_params={"scale": 0.02},
-    )
-    flow = ContinuousMeanFlow(nn_diffusion)
-    x0 = torch.randn((16, 8, 4))
-    loss, comp = flow.loss(x0, return_components=True)
-    loss.backward()
-    print("loss", float(loss), "components", {k: float(v) for k, v in comp.items()})
-    prior = torch.zeros((2, 8, 4))
-    for N in (1, 4, 32):
-        x, _ = flow.sample(prior, sample_steps=N)
-        print(f"N={N} sample", x.shape, "finite", bool(torch.isfinite(x).all()))
+        r = torch.full_like(t, t_next)
+        if self.guided and condition_vec_cfg is not None:
+            # iMF: one forward; w_cfg is the textbook guidance strength (0 = unguided)
+            w_in = torch.full_like(t, float(w_cfg))
+            return model["diffusion"](xt, t, condition_vec_cfg, r=r, w=w_in)
+        if w_cfg == 1.0 or condition_vec_cfg is None:
+            return model["diffusion"](xt, t, condition_vec_cfg, r=r)
+        if w_cfg == 0.0:
+            return model["diffusion"](xt, t, None, r=r)
+        condition = dict_apply(condition_vec_cfg, concat_zeros, dim=0)
+        vel_all = model["diffusion"](
+            einops.repeat(xt, "b ... -> (2 b) ..."),
+            t.repeat(2),
+            condition,
+            r=r.repeat(2),
+        )
+        vel, vel_uncond = torch.chunk(vel_all, 2, dim=0)
+        return w_cfg * vel + (1 - w_cfg) * vel_uncond

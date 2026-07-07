@@ -80,7 +80,12 @@ class ContinuousMeanFlow(DiffusionModel):
     Args mirror ``ContinuousShortcutFlow`` plus:
         time_mu, time_sigma (float): logit-normal params for sampling ``(r, t)``.
         r_not_equal_t_ratio (float): fraction of the batch with ``r < t`` (the
-            rest use ``r = t`` ⇒ flow matching). Default 0.75.
+            rest use ``r = t`` ⇒ flow matching). Default 0.25 — the reference
+            optimum (arXiv:2505.13447 Table 1a: 25% r≠t best, FID 61.06 vs
+            67.32 @100%; official repo ``data_proportion=0.75`` ⇒ 25% r≠t;
+            iMF uses 50%). Until 2026-07 this defaulted to 0.75 (inverted vs
+            the reference — review finding B2); runs record their value in
+            ``config.json``.
         adaptive_p (float): exponent of the adaptive-MSE weight (0 ⇒ plain MSE).
         cfg_omega, cfg_kappa (float): baked-CFG mix (``ω=1, κ=0`` ⇒ unguided).
         use_jvp (bool): JVP via ``torch.func.jvp`` (default) or a finite-
@@ -109,7 +114,7 @@ class ContinuousMeanFlow(DiffusionModel):
         x_min: Optional[torch.Tensor] = None,
         time_mu: float = -0.4,
         time_sigma: float = 1.0,
-        r_not_equal_t_ratio: float = 0.75,
+        r_not_equal_t_ratio: float = 0.25,
         adaptive_p: float = 1.0,
         cfg_omega: float = 1.0,
         cfg_kappa: float = 0.0,

@@ -713,7 +713,11 @@ class ContinuousRectifiedFlow(DiffusionModel):
             # fix the known portion, and preserve the sampling history
             xt = xt * (1.0 - self.fix_mask) + prior * self.fix_mask
             if preserve_history:
-                log["sample_history"][:, sample_steps - i + 1] = xt.cpu().numpy()
+                # sample_history is a list (one (B, *x_shape) array per stop, initial state
+                # first — same layout as flow_shortcut/flow_meanflow); the previous
+                # numpy-style indexed write crashed with TypeError on any
+                # preserve_history=True call (review 2026-07, finding B1).
+                log["sample_history"].append(xt.cpu().numpy())
 
         # ================= Post-processing =================
         if self.clip_pred:

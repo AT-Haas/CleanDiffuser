@@ -10,6 +10,7 @@ class contributes the JVP MeanFlow-identity loss and the ``r``-spanned per-step 
 See the class docstring for the identity and ``planning/IMPLEMENTATION_PLAN.md`` for context.
 """
 
+import logging
 from typing import Optional, Union
 
 import einops
@@ -17,6 +18,8 @@ import torch
 
 from cleandiffuser.classifier import BaseClassifier
 from cleandiffuser.diffusion.flow_map import ContinuousFlowMap
+
+_flow_map_log = logging.getLogger("cleandiffuser.diffusion.flow_meanflow")
 from cleandiffuser.nn_condition import BaseNNCondition
 from cleandiffuser.nn_diffusion import BaseNNDiffusion
 from cleandiffuser.utils import TensorDict, at_least_ndim, concat_zeros, dict_apply
@@ -304,15 +307,26 @@ class ContinuousMeanFlow(ContinuousFlowMap):
         """MeanFlow per-step velocity: one forward integrating ``[t_next, t_curr]`` via
         ``r = t_next``.
 
-        Guided (iMF) models do a single forward with ``w_cfg`` as the textbook guidance
-        strength (0 = unguided; dedicated ``w`` kwarg lands with the API alignment);
-        unguided models use the plain conditional/unconditional forward or, for
-        ``w_cfg ∉ {0, 1}``, the legacy double-batch post-hoc CFG blend.
+        Guided (iMF) models do a single guided forward with the dedicated ``w`` kwarg as
+        the textbook strength (0 = conditional; ``condition_vec_cfg=None`` & ``w=0`` ⇒ the
+        unconditional field — mirrors ``ContinuousShortcutFlow``). Legacy spelling: guided
+        callers that passed the scale through ``w_cfg`` (pre-2026-07) still work via a
+        shim + WARNING, except the ambiguous ``w_cfg=1.0`` (indistinguishable from the
+        class default), which now means ``w=0``. Unguided models use the plain
+        conditional/unconditional forward or, for ``w_cfg ∉ {0, 1}``, the legacy
+        double-batch post-hoc CFG blend (the documented compounding baseline).
         """
         r = torch.full_like(t, t_next)
-        if self.guided and condition_vec_cfg is not None:
-            # iMF: one forward; w_cfg is the textbook guidance strength (0 = unguided)
-            w_in = torch.full_like(t, float(w_cfg))
+        if self.guided:
+            w_eff = float(w)
+            if w_eff == 0.0 and w_cfg is not None and w_cfg != 1.0:
+                _flow_map_log.warning(
+                    "ContinuousMeanFlow: guided sampling received the scale via the legacy "
+                    "w_cfg=%s — pass w=<scale> instead (w_cfg shim kept for back-compat).",
+                    w_cfg,
+                )
+                w_eff = float(w_cfg)
+            w_in = torch.full_like(t, w_eff)
             return model["diffusion"](xt, t, condition_vec_cfg, r=r, w=w_in)
         if w_cfg == 1.0 or condition_vec_cfg is None:
             return model["diffusion"](xt, t, condition_vec_cfg, r=r)

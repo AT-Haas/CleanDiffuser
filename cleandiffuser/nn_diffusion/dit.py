@@ -403,7 +403,74 @@ class DiT1dWithACICrossAttention(DiT1d):
         return x_emb
 
 
-class DiT1dShortcut(DiT1d):
+class _FlowMapScalarCondMixin:
+    """Shared machinery for the DiT1d flow-map heads (``DiT1dShortcut`` / ``DiT1dMeanFlow``).
+
+    Provides the zero-init two-layer scalar-conditioning head used for the step size
+    ``d``, the interval end ``r``, and the guidance scale ``w`` (zero-init keeps the
+    base ``DiT1d`` behavior at init), the None/float/0-dim → ``(B,)`` scalar
+    normalization, and the common forward body (condition unpack, embedding sums,
+    blocks, final layer). Subclass forwards shrink to: normalize their extra time
+    input, embed it through their named head, delegate here.
+    """
+
+    def _make_scalar_head(self) -> nn.Sequential:
+        """The zero-init 2-layer MLP head (Linear→SiLU→Linear; last layer zeroed so the
+        input contributes nothing at init — the same trick as the adaLN zero-init)."""
+        emb_dim = self.t_proj[0].in_features
+        d_model = self.t_proj[0].out_features
+        head = nn.Sequential(
+            nn.Linear(emb_dim, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
+        )
+        nn.init.normal_(head[0].weight, std=0.02)
+        nn.init.zeros_(head[-1].weight)
+        nn.init.zeros_(head[-1].bias)
+        return head
+
+    @staticmethod
+    def _scalar_like(val, t):
+        """Normalize a scalar conditioning input to ``(B,)`` like ``t``: ``None`` passes
+        through (caller applies its own default), floats broadcast, 0-dim expands."""
+        if val is None:
+            return None
+        if not isinstance(val, torch.Tensor):
+            return torch.full_like(t, float(val), dtype=t.dtype)
+        if val.ndim == 0:
+            return val.expand_as(t).to(dtype=t.dtype)
+        return val.to(dtype=t.dtype)
+
+    def _flowmap_forward(self, x, t, condition, extra_emb, w):
+        """Common forward body; ``extra_emb`` is the subclass's embedded ``d``/``r`` head
+        output, ``w`` the optional guidance scale (embedded through ``w_proj`` when given)."""
+        if isinstance(condition, dict):
+            vec_condition = condition.get("vec_condition", None)
+            seq_condition = condition.get("seq_condition", None)
+            seq_condition_mask = condition.get("seq_condition_mask", None)
+        else:
+            vec_condition = condition
+            seq_condition = None
+            seq_condition_mask = None
+
+        t_emb = self.t_proj(self.map_noise(t))
+        x_emb = self.x_proj(x) + self.pos_emb
+
+        cond_emb = t_emb + extra_emb
+        w_tensor = self._scalar_like(w, t)
+        if w_tensor is not None:  # iSM/iMF: guidance scale as a conditioning input
+            cond_emb = cond_emb + self.w_proj(self.map_noise(w_tensor))
+        if vec_condition is not None:
+            cond_emb = cond_emb + self.cond_proj(vec_condition)
+
+        if seq_condition is not None and self.seq_cond_proj is not None:
+            seq_condition = self.seq_cond_proj(seq_condition)
+
+        for block in self.blocks:
+            x_emb = block(x_emb, cond_emb, seq_condition, seq_condition_mask)
+
+        return self.final_layer(x_emb, cond_emb)
+
+
+class DiT1dShortcut(_FlowMapScalarCondMixin, DiT1d):
     """DiT1d backbone augmented with a shortcut step-size input ``d``.
 
     Used by ``ContinuousShortcutModel`` (Frans et al., 2024). The network
@@ -439,26 +506,12 @@ class DiT1dShortcut(DiT1d):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        emb_dim = self.t_proj[0].in_features
-        d_model = self.t_proj[0].out_features
-        self.d_proj = nn.Sequential(
-            nn.Linear(emb_dim, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
-        )
-        nn.init.normal_(self.d_proj[0].weight, std=0.02)
-        # zero-init the last linear so d contributes nothing at init
-        nn.init.zeros_(self.d_proj[-1].weight)
-        nn.init.zeros_(self.d_proj[-1].bias)
-
+        self.d_proj = self._make_scalar_head()
         # iSM (Improved Shortcut Models, arXiv:2510.21250): "Intrinsic Guidance" makes the
         # CFG scale ``w`` an explicit conditioning input so it can be varied at inference
         # (no exponential compounding over big jumps, no retraining per w). Zero-init so a
         # model trained without ``w`` (vanilla Shortcut) is unaffected. Mirrors DiT1dMeanFlow.
-        self.w_proj = nn.Sequential(
-            nn.Linear(emb_dim, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
-        )
-        nn.init.normal_(self.w_proj[0].weight, std=0.02)
-        nn.init.zeros_(self.w_proj[-1].weight)
-        nn.init.zeros_(self.w_proj[-1].bias)
+        self.w_proj = self._make_scalar_head()
 
     def forward(
         self,
@@ -468,51 +521,14 @@ class DiT1dShortcut(DiT1d):
         d: Optional[Union[torch.Tensor, float]] = None,
         w: Optional[Union[torch.Tensor, float]] = None,
     ):
-        if isinstance(condition, dict):
-            vec_condition = condition.get("vec_condition", None)
-            seq_condition = condition.get("seq_condition", None)
-            seq_condition_mask = condition.get("seq_condition_mask", None)
-        else:
-            vec_condition = condition
-            seq_condition = None
-            seq_condition_mask = None
-
-        if d is None:
-            d_tensor = torch.zeros_like(t, dtype=t.dtype)
-        elif not isinstance(d, torch.Tensor):
-            d_tensor = torch.full_like(t, float(d), dtype=t.dtype)
-        elif d.ndim == 0:
-            d_tensor = d.expand_as(t).to(dtype=t.dtype)
-        else:
-            d_tensor = d.to(dtype=t.dtype)
-
-        t_emb = self.t_proj(self.map_noise(t))
+        d_tensor = self._scalar_like(d, t)
+        if d_tensor is None:
+            d_tensor = torch.zeros_like(t, dtype=t.dtype)  # d=None ⇒ flow-matching head
         d_emb = self.d_proj(self.map_noise(d_tensor))
-        x_emb = self.x_proj(x) + self.pos_emb
-
-        cond_emb = t_emb + d_emb
-        if w is not None:  # iSM Intrinsic Guidance: guidance scale as a conditioning input
-            if not isinstance(w, torch.Tensor):
-                w_tensor = torch.full_like(t, float(w), dtype=t.dtype)
-            elif w.ndim == 0:
-                w_tensor = w.expand_as(t).to(dtype=t.dtype)
-            else:
-                w_tensor = w.to(dtype=t.dtype)
-            cond_emb = cond_emb + self.w_proj(self.map_noise(w_tensor))
-        if vec_condition is not None:
-            cond_emb = cond_emb + self.cond_proj(vec_condition)
-
-        if seq_condition is not None and self.seq_cond_proj is not None:
-            seq_condition = self.seq_cond_proj(seq_condition)
-
-        for block in self.blocks:
-            x_emb = block(x_emb, cond_emb, seq_condition, seq_condition_mask)
-
-        x_emb = self.final_layer(x_emb, cond_emb)
-        return x_emb
+        return self._flowmap_forward(x, t, condition, d_emb, w)
 
 
-class DiT1dMeanFlow(DiT1d):
+class DiT1dMeanFlow(_FlowMapScalarCondMixin, DiT1d):
     """DiT1d backbone for MeanFlow (Geng et al., 2025, arXiv:2505.13447).
 
     The network predicts the **average velocity** ``u(x, r, t)`` over the
@@ -543,25 +559,11 @@ class DiT1dMeanFlow(DiT1d):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        emb_dim = self.t_proj[0].in_features
-        d_model = self.t_proj[0].out_features
-        self.r_proj = nn.Sequential(
-            nn.Linear(emb_dim, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
-        )
-        nn.init.normal_(self.r_proj[0].weight, std=0.02)
-        # zero-init the last linear so r contributes nothing at init (recovers DiT1d)
-        nn.init.zeros_(self.r_proj[-1].weight)
-        nn.init.zeros_(self.r_proj[-1].bias)
-
+        self.r_proj = self._make_scalar_head()  # zero-init: r contributes nothing at init
         # iMF (improved MeanFlow, arXiv:2512.02012): the CFG guidance scale ``w`` is an
         # explicit conditioning input, so it can be varied at inference. Zero-init so a
         # model trained without ``w`` (vanilla MeanFlow) is unaffected.
-        self.w_proj = nn.Sequential(
-            nn.Linear(emb_dim, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
-        )
-        nn.init.normal_(self.w_proj[0].weight, std=0.02)
-        nn.init.zeros_(self.w_proj[-1].weight)
-        nn.init.zeros_(self.w_proj[-1].bias)
+        self.w_proj = self._make_scalar_head()
 
     def forward(
         self,
@@ -571,48 +573,11 @@ class DiT1dMeanFlow(DiT1d):
         r: Optional[Union[torch.Tensor, float]] = None,
         w: Optional[Union[torch.Tensor, float]] = None,
     ):
-        if isinstance(condition, dict):
-            vec_condition = condition.get("vec_condition", None)
-            seq_condition = condition.get("seq_condition", None)
-            seq_condition_mask = condition.get("seq_condition_mask", None)
-        else:
-            vec_condition = condition
-            seq_condition = None
-            seq_condition_mask = None
-
-        if r is None:
+        r_tensor = self._scalar_like(r, t)
+        if r_tensor is None:
             r_tensor = t  # interval collapses → instantaneous velocity
-        elif not isinstance(r, torch.Tensor):
-            r_tensor = torch.full_like(t, float(r), dtype=t.dtype)
-        elif r.ndim == 0:
-            r_tensor = r.expand_as(t).to(dtype=t.dtype)
-        else:
-            r_tensor = r.to(dtype=t.dtype)
-
-        t_emb = self.t_proj(self.map_noise(t))
         r_emb = self.r_proj(self.map_noise(r_tensor))
-        x_emb = self.x_proj(x) + self.pos_emb
-
-        cond_emb = t_emb + r_emb
-        if w is not None:  # iMF: guidance scale as a conditioning input
-            if not isinstance(w, torch.Tensor):
-                w_tensor = torch.full_like(t, float(w), dtype=t.dtype)
-            elif w.ndim == 0:
-                w_tensor = w.expand_as(t).to(dtype=t.dtype)
-            else:
-                w_tensor = w.to(dtype=t.dtype)
-            cond_emb = cond_emb + self.w_proj(self.map_noise(w_tensor))
-        if vec_condition is not None:
-            cond_emb = cond_emb + self.cond_proj(vec_condition)
-
-        if seq_condition is not None and self.seq_cond_proj is not None:
-            seq_condition = self.seq_cond_proj(seq_condition)
-
-        for block in self.blocks:
-            x_emb = block(x_emb, cond_emb, seq_condition, seq_condition_mask)
-
-        x_emb = self.final_layer(x_emb, cond_emb)
-        return x_emb
+        return self._flowmap_forward(x, t, condition, r_emb, w)
 
 
 if __name__ == "__main__":

@@ -182,8 +182,11 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
         # Encode the condition ONCE (with whatever CFG dropout the condition
         # module applies in train mode). Re-using the same encoded vector for
         # both the LHS and the EMA-target RHS keeps the self-consistency
-        # objective well-defined under random label dropout.
-        cond_emb = self.model["condition"](condition) if condition is not None else None
+        # objective well-defined under random label dropout. Condition-free nets
+        # (``nn_condition=None``, e.g. the intrinsic-energy family, F7) never see a
+        # cond input — ``condition`` then only feeds the ∇E callback's tilt below.
+        cond_emb = (self.model["condition"](condition)
+                    if (condition is not None and self._has_condition) else None)
 
         B_fm = int(round(B * self.fm_consistency_ratio))
         B_fm = max(0, min(B, B_fm))
@@ -205,22 +208,26 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
 
             v_fm = x0_fm - x1_fm  # data-ward velocity (constant along the straight path)
             w_fm = None
-            if self.guided and self.energy_grad_fn is not None and cond_fm is not None:
-                # iSM energy guidance: regress s_θ(xt,t,c,0,w) to the ENERGY-tilted velocity
+            if self.guided and self.energy_grad_fn is not None:
+                # iSM energy guidance: regress s_θ(xt,t,0,w) to the ENERGY-tilted velocity
                 # v + w·[t/(1−t)]·∇E (∇E = score_pt − score_qt analytic, or a learned CEP
                 # gradient). w=0 ⇒ unguided q0, w=1 ⇒ exact p0 (analytic ∇E). The SC branch
                 # threads the same w through its own half-/full-steps, so it enforces this
                 # field's self-consistency for free (target-agnostic). Gate/cap: _energy_tilt.
+                # No net condition required: the intrinsic-energy family trains condition-free
+                # (F7) — a cond input would let the net fit the reward-conditional base field
+                # instead of q0 (the w=0 contamination seen in the 2026-07 converged runs).
                 w_fm = self._sample_w(B_fm)
-                # Hand the callback the raw condition slice too (per-sample goals on Maze2D;
+                # Hand the callback the raw condition slice (per-sample goals on Maze2D;
                 # condition-free callbacks — e.g. the E1 toy's analytic ∇E — just ignore it).
                 cond_raw_fm = condition[:B_fm] if isinstance(condition, torch.Tensor) else None
                 target_fm = self._energy_tilt(xt_fm, t_fm, v_fm, w_fm, cond_raw_fm)
             elif self.guided and cond_fm is not None:
                 # iSM Intrinsic Guidance: regress s_θ(xt,t,c,0,w) to the CFG-tilted velocity
-                # (1+w)·v_cond − w·v_uncond (v_uncond from the EMA net at w=0, stop-grad).
+                # (1+w)·v_cond − w·v_uncond (v_uncond from the EMA net at the label-dropout
+                # null token + w=0, stop-grad; run_review_2026-07-14 F1).
                 w_fm = self._sample_w(B_fm)
-                target_fm = self._cfg_tilt(xt_fm, t_fm, v_fm, w_fm, d=d_fm)
+                target_fm = self._cfg_tilt(xt_fm, t_fm, v_fm, w_fm, cond_fm, d=d_fm)
             else:
                 target_fm = v_fm
             pred_fm = self.model["diffusion"](xt_fm, t_fm, cond_fm, d=d_fm, w=w_fm)
@@ -258,9 +265,9 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
             # iSM: the self-consistency bootstrap is evaluated at a single sampled w,
             # threaded through both half-steps AND the full d-step, so consistency holds
             # for the guided velocity field at every w (w=None ⇒ vanilla, w ignored).
-            w_sc = None
-            if self.guided and cond_sc is not None:
-                w_sc = self._sample_w(B_sc)
+            # Gated on ``guided`` alone: condition-free guided nets (intrinsic-energy, F7)
+            # have cond_sc=None but still need their w-field's self-consistency enforced.
+            w_sc = self._sample_w(B_sc) if self.guided else None
 
             target_model = self.model_ema if self.bootstrap_target == "ema" else self.model
             with torch.no_grad():
@@ -316,20 +323,24 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
         """Shortcut per-step velocity: one forward at step size ``d = t_curr − t_next``.
 
         Guided models do a single guided forward with ``w`` as an input
-        (``condition_vec_cfg=None`` & ``w=0`` ⇒ the unconditional field); unguided
-        models use the plain conditional/unconditional forward or, for
-        ``w_cfg ∉ {0, 1}``, the legacy double-batch post-hoc CFG blend
-        ``w_cfg·v_cond + (1−w_cfg)·v_uncond`` (the documented compounding baseline).
+        (``condition_vec_cfg=None`` & ``w=0`` ⇒ the unconditional field — queried at the
+        label-dropout null token for conditional nets, F1); unguided models use the plain
+        conditional/unconditional forward or, for ``w_cfg ∉ {0, 1}``, the legacy
+        double-batch post-hoc CFG blend ``w_cfg·v_cond + (1−w_cfg)·v_uncond`` (the
+        documented compounding baseline).
         """
         d_tensor = torch.full_like(t, t_curr - t_next)
         if self.guided:
             # iSM Intrinsic Guidance: one guided forward with w as an input
             # (condition_vec_cfg=None & w=0 ⇒ unconditional; w>0 ⇒ guided).
+            if condition_vec_cfg is None:
+                condition_vec_cfg = self._null_cond_vec(model, xt.shape[0])
             return model["diffusion"](xt, t, condition_vec_cfg, d=d_tensor, w=w)
-        if w_cfg == 1.0:
+        if w_cfg == 1.0 and condition_vec_cfg is not None:
             return model["diffusion"](xt, t, condition_vec_cfg, d=d_tensor)
         if w_cfg == 0.0 or condition_vec_cfg is None:
-            return model["diffusion"](xt, t, None, d=d_tensor)
+            return model["diffusion"](xt, t, self._null_cond_vec(model, xt.shape[0]),
+                                      d=d_tensor)
         condition = dict_apply(condition_vec_cfg, concat_zeros, dim=0)
         vel_all = model["diffusion"](
             einops.repeat(xt, "b ... -> (2 b) ..."),

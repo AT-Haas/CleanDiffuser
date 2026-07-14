@@ -184,7 +184,10 @@ class ContinuousMeanFlow(ContinuousFlowMap):
         """
         B = x0.shape[0]
         eps = torch.randn_like(x0) if x1 is None else x1
-        cond_emb = self.model["condition"](condition) if condition is not None else None
+        # Condition-free nets (``nn_condition=None``, e.g. the intrinsic-energy family, F7)
+        # never see a cond input — ``condition`` then only feeds the ∇E callback below.
+        cond_emb = (self.model["condition"](condition)
+                    if (condition is not None and self._has_condition) else None)
 
         r, t, fm_mask = self._sample_r_t(B)
         xt = x0 + at_least_ndim(t, x0.dim()) * (eps - x0)  # (1-t)x0 + t·ε
@@ -194,12 +197,14 @@ class ContinuousMeanFlow(ContinuousFlowMap):
         # Effective (optionally CFG-tilted) velocity used in the identity, plus the
         # iMF guidance-scale input ``w_in`` (None unless training the guided variant).
         w_in = None
-        if self.guided and self.energy_grad_fn is not None and cond_emb is not None:
+        if self.guided and self.energy_grad_fn is not None:
             # iMF energy guidance: the identity's instantaneous velocity becomes the
             # ENERGY-tilted v + w·[t/(1−t)]·∇E (∇E = score_pt − score_qt analytic, or a
             # learned CEP gradient), so the MeanFlow bootstrap enforces the average-velocity
             # consistency of this field at the sampled w. w=0 ⇒ unguided q0, w=1 ⇒ exact p0
-            # (analytic ∇E). Gate/cap: _energy_tilt.
+            # (analytic ∇E). Gate/cap: _energy_tilt. No net condition required — the
+            # intrinsic-energy family trains condition-free (F7): a cond input would let the
+            # net fit the reward-conditional base instead of q0 (w=0 contamination).
             w_in = self._sample_w(B)
             # Hand the callback the raw condition too (per-sample goals on Maze2D;
             # condition-free callbacks — e.g. the E1 toy's analytic ∇E — just ignore it).
@@ -207,13 +212,14 @@ class ContinuousMeanFlow(ContinuousFlowMap):
             v_eff = self._energy_tilt(xt, t, v, w_in, cond_raw)
         elif self.guided and cond_emb is not None:
             # iMF: condition on a sampled guidance scale w; regress u_w to the CFG-tilted
-            # velocity (1+w)·v_cond − w·v_uncond (uncond from the EMA net, stop-grad).
+            # velocity (1+w)·v_cond − w·v_uncond (uncond from the EMA net at the
+            # label-dropout null token, stop-grad; run_review_2026-07-14 F1).
             w_in = self._sample_w(B)
-            v_eff = self._cfg_tilt(xt, t, v, w_in, r=t)
+            v_eff = self._cfg_tilt(xt, t, v, w_in, cond_emb, r=t)
         elif self.baked_cfg and cond_emb is not None:
             with torch.no_grad():
                 u_cond = self.model["diffusion"](xt, t, cond_emb, r=t)
-                u_uncond = self.model["diffusion"](xt, t, None, r=t)
+                u_uncond = self.model["diffusion"](xt, t, torch.zeros_like(cond_emb), r=t)
             v_eff = (
                 self.cfg_omega * v
                 + self.cfg_kappa * u_cond
@@ -309,7 +315,8 @@ class ContinuousMeanFlow(ContinuousFlowMap):
 
         Guided (iMF) models do a single guided forward with the dedicated ``w`` kwarg as
         the textbook strength (0 = conditional; ``condition_vec_cfg=None`` & ``w=0`` ⇒ the
-        unconditional field — mirrors ``ContinuousShortcutFlow``). Legacy spelling: guided
+        unconditional field, queried at the label-dropout null token for conditional nets
+        (F1) — mirrors ``ContinuousShortcutFlow``). Legacy spelling: guided
         callers that passed the scale through ``w_cfg`` (pre-2026-07) still work via a
         shim + WARNING, except the ambiguous ``w_cfg=1.0`` (indistinguishable from the
         class default), which now means ``w=0``. Unguided models use the plain
@@ -327,11 +334,15 @@ class ContinuousMeanFlow(ContinuousFlowMap):
                 )
                 w_eff = float(w_cfg)
             w_in = torch.full_like(t, w_eff)
+            if condition_vec_cfg is None:
+                condition_vec_cfg = self._null_cond_vec(model, xt.shape[0])
             return model["diffusion"](xt, t, condition_vec_cfg, r=r, w=w_in)
-        if w_cfg == 1.0 or condition_vec_cfg is None:
+        if condition_vec_cfg is None:
+            return model["diffusion"](xt, t, self._null_cond_vec(model, xt.shape[0]), r=r)
+        if w_cfg == 1.0:
             return model["diffusion"](xt, t, condition_vec_cfg, r=r)
         if w_cfg == 0.0:
-            return model["diffusion"](xt, t, None, r=r)
+            return model["diffusion"](xt, t, self._null_cond_vec(model, xt.shape[0]), r=r)
         condition = dict_apply(condition_vec_cfg, concat_zeros, dim=0)
         vel_all = model["diffusion"](
             einops.repeat(xt, "b ... -> (2 b) ..."),

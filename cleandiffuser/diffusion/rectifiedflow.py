@@ -14,7 +14,24 @@ from cleandiffuser.utils import (
     concat_zeros,
     dict_apply,
     get_sampling_scheduler,
+    null_cond_emb,
 )
+
+
+def _uncond_vec(flow, model, n: int):
+    """The unconditional query for a rectified-flow sampler: the label-dropout null token
+    (zeroed condition embedding) for conditional models — matching what the double-batch
+    ``concat_zeros`` blend feeds, so ``w_cfg=0`` is the ``w_cfg→0`` limit of the blend —
+    and ``None`` for genuinely unconditional models (run_review_2026-07-14 F1).
+
+    Args:
+        flow: The ``DiffusionModel`` (supplies ``_has_condition`` and the device).
+        model: The ``ModuleDict`` being sampled (``flow.model`` or ``flow.model_ema``).
+        n: Batch size of the returned embedding.
+    """
+    if not getattr(flow, "_has_condition", False):
+        return None
+    return null_cond_emb(model["diffusion"], n, flow.device)
 
 
 class DiscreteRectifiedFlow(DiffusionModel):
@@ -350,9 +367,9 @@ class DiscreteRectifiedFlow(DiffusionModel):
                 if w_cfg == 1.0:
                     vel = model["diffusion"](xt, t, condition_vec_cfg)
 
-                # unconditional prediction
+                # unconditional prediction (label-dropout null token on conditional nets, F1)
                 elif w_cfg == 0.0:
-                    vel = model["diffusion"](xt, t, None)
+                    vel = model["diffusion"](xt, t, _uncond_vec(self, model, xt.shape[0]))
 
                 else:
                     condition = dict_apply(condition_vec_cfg, concat_zeros, dim=0)
@@ -693,9 +710,9 @@ class ContinuousRectifiedFlow(DiffusionModel):
                 if w_cfg == 1.0:
                     vel = model["diffusion"](xt, t, condition_vec_cfg)
 
-                # unconditional prediction
+                # unconditional prediction (label-dropout null token on conditional nets, F1)
                 elif w_cfg == 0.0:
-                    vel = model["diffusion"](xt, t, None)
+                    vel = model["diffusion"](xt, t, _uncond_vec(self, model, xt.shape[0]))
 
                 else:
                     condition = dict_apply(condition_vec_cfg, concat_zeros, dim=0)

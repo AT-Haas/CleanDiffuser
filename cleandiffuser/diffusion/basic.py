@@ -53,6 +53,11 @@ class DiffusionModel(L.LightningModule):
         )
 
         # nn_condition is None means that the model is not conditioned on any input.
+        # Remember which case we are in before defaulting: samplers/targets need to know
+        # whether an "unconditional" query should be the label-dropout null token (a zeroed
+        # condition embedding, for conditional models) or a true condition=None forward
+        # (unconditional models). See planning/run_review_2026-07-14.md F1.
+        self._has_condition = nn_condition is not None
         nn_condition = nn_condition or IdentityCondition()
 
         # Use EMA model for stable generation outcomes

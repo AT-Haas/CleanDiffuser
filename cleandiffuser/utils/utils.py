@@ -78,6 +78,32 @@ def concat_zeros(x: torch.Tensor, dim: int = 0):
     return torch.cat([x, torch.zeros_like(x)], dim=dim)
 
 
+def null_cond_emb(nn_diffusion, n: int, device):
+    """The label-dropout "null token" of a conditional net: a zeroed condition embedding.
+
+    Training-time CFG label dropout zeroes the condition module's *output embedding*
+    (``IdentityCondition`` masks it to 0), after which the DiT adds ``cond_proj(zeros)`` —
+    so the unconditional branch a conditional model actually learns lives at the zeros
+    embedding, exactly what the double-batch CFG blend feeds via :func:`concat_zeros`.
+    Passing ``condition=None`` instead skips ``cond_proj`` entirely — an input such a net
+    never sees in training (run_review_2026-07-14 F1) — so every "unconditional reference"
+    query on a conditional model must use this token.
+
+    Args:
+        nn_diffusion: The diffusion backbone; its ``cond_proj`` first layer supplies the
+            embedding width. Returns ``None`` if the backbone has no ``cond_proj``.
+        n (int): Batch size of the returned embedding.
+        device: Torch device of the returned tensor.
+
+    Returns:
+        ``(n, emb_dim)`` zeros tensor, or ``None`` when the backbone takes no vec condition.
+    """
+    cond_proj = getattr(nn_diffusion, "cond_proj", None)
+    if cond_proj is None:
+        return None
+    return torch.zeros((n, cond_proj[0].in_features), device=device)
+
+
 @numba.jit(nopython=True)
 def create_indices(
     episode_ends: np.ndarray,

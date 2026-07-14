@@ -21,7 +21,7 @@ from cleandiffuser.classifier import BaseClassifier
 from cleandiffuser.diffusion.basic import DiffusionModel
 from cleandiffuser.nn_condition import BaseNNCondition
 from cleandiffuser.nn_diffusion import BaseNNDiffusion
-from cleandiffuser.utils import TensorDict, at_least_ndim, get_sampling_scheduler
+from cleandiffuser.utils import TensorDict, at_least_ndim, get_sampling_scheduler, null_cond_emb
 
 log = logging.getLogger("cleandiffuser.diffusion.flow_map")
 
@@ -152,15 +152,40 @@ class ContinuousFlowMap(DiffusionModel):
                                     corr.dim())
         return (v + corr).detach()
 
-    def _cfg_tilt(self, xt, t, v, w, **span_kwargs):
+    def _null_cond_vec(self, model, n: int):
+        """The label-dropout null token (zeroed condition embedding, ``(n, emb)``) for a
+        *conditional* model, or ``None`` for an unconditional one. This — not
+        ``condition=None``, which skips the DiT's ``cond_proj`` and is an input a
+        conditional net never sees in training — is the correct unconditional query
+        (run_review_2026-07-14 F1; matches label dropout and the ``concat_zeros`` blend).
+
+        Args:
+            model: The ``ModuleDict`` being sampled (``self.model`` or ``self.model_ema``).
+            n: Batch size of the returned embedding.
+        """
+        if not getattr(self, "_has_condition", False):
+            return None
+        return null_cond_emb(model["diffusion"], n, self.device)
+
+    def _cfg_tilt(self, xt, t, v, w, cond_emb, **span_kwargs):
         """CFG-tilted regression target ``((1+w)·v − w·v_uncond).detach()`` (iSM/iMF).
 
-        ``v_uncond`` is the EMA net at ``(cond=None, w=0)`` with the subclass's span kwarg
+        ``v_uncond`` is the EMA net at the **label-dropout null token** (the zeroed
+        condition embedding — what dropout actually trains as the unconditional branch;
+        F1 of run_review_2026-07-14, superseding the old ``cond=None`` query, which the
+        net never sees in training) and ``w=0``, with the subclass's span kwarg
         (shortcut ``d=0`` / meanflow ``r=t``) — the training-time definition of the
-        unguided reference field (also the accessor convention; review finding B3).
+        unguided reference field (also the accessor convention).
+
+        Args:
+            xt, t, v: Noised batch, times, and per-sample data velocity (regression base).
+            w: Per-sample guidance scales ``(B,)``.
+            cond_emb: The encoded condition batch (non-``None`` in every guided branch);
+                only its shape/device seed the zeroed null token.
+            **span_kwargs: The subclass's span input (``d=`` / ``r=``).
         """
         with torch.no_grad():
-            v_uncond = self.model_ema["diffusion"](xt, t, None,
+            v_uncond = self.model_ema["diffusion"](xt, t, torch.zeros_like(cond_emb),
                                                    w=torch.zeros_like(t), **span_kwargs)
         ww = at_least_ndim(w, v.dim())
         return ((1.0 + ww) * v - ww * v_uncond).detach()

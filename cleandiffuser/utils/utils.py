@@ -86,7 +86,7 @@ def null_cond_emb(nn_diffusion, n: int, device):
     so the unconditional branch a conditional model actually learns lives at the zeros
     embedding, exactly what the double-batch CFG blend feeds via :func:`concat_zeros`.
     Passing ``condition=None`` instead skips ``cond_proj`` entirely — an input such a net
-    never sees in training (run_review_2026-07-14 F1) — so every "unconditional reference"
+    never sees in training (2026-07-14_run_review F1) — so every "unconditional reference"
     query on a conditional model must use this token.
 
     Args:

@@ -6,7 +6,7 @@ finite jump of size ``d`` (``d=0`` ⇒ flow matching), trained with a flow-match
 EMA self-consistency objective so a single forward pass can span a whole ``t=1→0`` step.
 The forward process, guided-target tilts and Euler sampling scaffold live in
 ``ContinuousFlowMap`` (``flow_map.py``); this class contributes the hybrid FM+SC loss and
-the ``d``-spanned per-step velocity. See ``planning/IMPLEMENTATION_PLAN.md`` for context.
+the ``d``-spanned per-step velocity. See ``planning/2026-06-19_IMPLEMENTATION_PLAN.md`` for context.
 """
 
 from typing import Optional, Union
@@ -72,7 +72,7 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
     the *same* ``w``. ``sample(..., w=...)`` then does one guided forward per step
     (no post-hoc blend). Mirrors the iMF w-conditioning in ``ContinuousMeanFlow``.
 
-    Guidance-tilt placement (adjudicated in ``planning/code_review_2026-07.md``): the
+    Guidance-tilt placement (adjudicated in ``planning/2026-07-07_code_review.md``): the
     CFG/energy tilt enters **only the d=0 FM target** here — the SC bootstrap is
     *target-agnostic* (it threads the sampled ``w`` through the target net's own half-
     and full-steps), so whatever w-field the FM branch pins down at ``d=0`` is exactly
@@ -81,7 +81,7 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
     tangent): each is the unique correct port of its own objective, not an inconsistency.
 
     Faithfulness notes vs the reference (github.com/kvfrans/shortcut-models,
-    ``targets_shortcut.py``; details in ``planning/code_review_2026-07.md`` N1): our
+    ``targets_shortcut.py``; details in ``planning/2026-07-07_code_review.md`` N1): our
     SC branch trains LHS steps down to ``d=2^-K_max`` (the reference's smallest LHS
     bootstrap ``d`` is one octave larger, with ``2^-7`` only as a target half-step, and
     its FM branch uses a smallest-``d`` token where we use exact ``d=0`` — the paper's
@@ -225,7 +225,7 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
             elif self.guided and cond_fm is not None:
                 # iSM Intrinsic Guidance: regress s_θ(xt,t,c,0,w) to the CFG-tilted velocity
                 # (1+w)·v_cond − w·v_uncond (v_uncond from the EMA net at the label-dropout
-                # null token + w=0, stop-grad; run_review_2026-07-14 F1).
+                # null token + w=0, stop-grad; 2026-07-14_run_review F1).
                 w_fm = self._sample_w(B_fm)
                 target_fm = self._cfg_tilt(xt_fm, t_fm, v_fm, w_fm, cond_fm, d=d_fm)
             else:

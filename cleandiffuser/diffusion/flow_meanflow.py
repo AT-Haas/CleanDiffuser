@@ -7,7 +7,7 @@ Generative Modeling", arXiv:2505.13447) plus the iMF guidance-as-conditioning an
 step (``sample_steps=1`` ⇒ one-step generation). The forward process, guided-target
 tilts and Euler sampling scaffold live in ``ContinuousFlowMap`` (``flow_map.py``); this
 class contributes the JVP MeanFlow-identity loss and the ``r``-spanned per-step velocity.
-See the class docstring for the identity and ``planning/IMPLEMENTATION_PLAN.md`` for context.
+See the class docstring for the identity and ``planning/2026-06-19_IMPLEMENTATION_PLAN.md`` for context.
 """
 
 import logging
@@ -67,7 +67,7 @@ class ContinuousMeanFlow(ContinuousFlowMap):
     ``v_θ = u_θ(z,t,t,w)``) as a tangent swap — gradient-identical to the reference's
     compound-predictor form since the swapped term is stop-grad.
 
-    Guidance-tilt placement (adjudicated in ``planning/code_review_2026-07.md``): the
+    Guidance-tilt placement (adjudicated in ``planning/2026-07-07_code_review.md``): the
     CFG/energy tilt enters ``v_eff``, which feeds **both** the identity target and the
     JVP z-tangent — the identity's ``du/dt`` is the total derivative *along the flow of
     the field being learned*, so the tangent must be the tilted field's velocity. This
@@ -213,7 +213,7 @@ class ContinuousMeanFlow(ContinuousFlowMap):
         elif self.guided and cond_emb is not None:
             # iMF: condition on a sampled guidance scale w; regress u_w to the CFG-tilted
             # velocity (1+w)·v_cond − w·v_uncond (uncond from the EMA net at the
-            # label-dropout null token, stop-grad; run_review_2026-07-14 F1).
+            # label-dropout null token, stop-grad; 2026-07-14_run_review F1).
             w_in = self._sample_w(B)
             v_eff = self._cfg_tilt(xt, t, v, w_in, cond_emb, r=t)
         elif self.baked_cfg and cond_emb is not None:

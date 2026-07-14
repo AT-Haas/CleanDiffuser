@@ -157,7 +157,7 @@ class ContinuousFlowMap(DiffusionModel):
         *conditional* model, or ``None`` for an unconditional one. This — not
         ``condition=None``, which skips the DiT's ``cond_proj`` and is an input a
         conditional net never sees in training — is the correct unconditional query
-        (run_review_2026-07-14 F1; matches label dropout and the ``concat_zeros`` blend).
+        (2026-07-14_run_review F1; matches label dropout and the ``concat_zeros`` blend).
 
         Args:
             model: The ``ModuleDict`` being sampled (``self.model`` or ``self.model_ema``).
@@ -172,7 +172,7 @@ class ContinuousFlowMap(DiffusionModel):
 
         ``v_uncond`` is the EMA net at the **label-dropout null token** (the zeroed
         condition embedding — what dropout actually trains as the unconditional branch;
-        F1 of run_review_2026-07-14, superseding the old ``cond=None`` query, which the
+        F1 of 2026-07-14_run_review, superseding the old ``cond=None`` query, which the
         net never sees in training) and ``w=0``, with the subclass's span kwarg
         (shortcut ``d=0`` / meanflow ``r=t``) — the training-time definition of the
         unguided reference field (also the accessor convention).

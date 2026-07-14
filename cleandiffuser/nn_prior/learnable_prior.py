@@ -55,7 +55,7 @@ class LearnableNoisePrior(nn.Module):
     observation. Documented simplification vs the reference (``github.com/ku-dmlab/PG``): the paper's
     prior is a **network-parameterized, observation-conditioned** tanh-squashed Gaussian; ours is a
     static (mixture-)Gaussian over the flattened noise — here conditioning enters via inpainting
-    instead (see ``planning/code_review_2026-07.md`` N7).
+    instead (see ``planning/2026-07-07_code_review.md`` N7).
 
     Args:
         dim: Dimensionality of the (flattened) initial-noise vector (E1 ring toy: ``2``).
@@ -227,7 +227,7 @@ def fit_prior_guidance(
         coverage_mix: Fraction of the value-regression batch drawn from base ``N(0,I)`` (the rest from
             the current prior), so ``V̄_φ`` covers both the reference and the shifted support. This mix
             is our robustness addition — the reference (``ku-dmlab/PG``) regresses on current-prior
-            draws only (code_review_2026-07.md N7).
+            draws only (2026-07-07_code_review.md N7).
         tanh_squash: Squash the prior means (see :class:`LearnableNoisePrior`).
         mean_scale: Squash amplitude (used iff ``tanh_squash``).
         value_hidden: Latent-value MLP width.

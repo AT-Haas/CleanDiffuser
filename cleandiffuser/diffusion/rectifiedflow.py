@@ -22,7 +22,7 @@ def _uncond_vec(flow, model, n: int):
     """The unconditional query for a rectified-flow sampler: the label-dropout null token
     (zeroed condition embedding) for conditional models — matching what the double-batch
     ``concat_zeros`` blend feeds, so ``w_cfg=0`` is the ``w_cfg→0`` limit of the blend —
-    and ``None`` for genuinely unconditional models (run_review_2026-07-14 F1).
+    and ``None`` for genuinely unconditional models (2026-07-14_run_review F1).
 
     Args:
         flow: The ``DiffusionModel`` (supplies ``_has_condition`` and the device).

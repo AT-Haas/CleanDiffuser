@@ -56,6 +56,12 @@ class ContinuousFlowMap(DiffusionModel):
     ENERGY_CORR_CAP: float = 50.0
     NOISE_GATE: float = 1e-3
 
+    # Per-sample cap on the reward-gradient norm used by the ``ractd`` family — the direct
+    # analogue of ENERGY_CORR_CAP. RACTD's own σ-ablation is non-monotone and collapses past
+    # σ≈1 (arXiv:2506.07822 App. E.4 Table 15: 0.8→108.3, 1.5→50.5, 2.0→17.0), an
+    # uncapped-correction failure; set to 0 to disable the cap and reproduce that cliff.
+    REWARD_GRAD_CAP: float = 50.0
+
     def __init__(
         self,
         nn_diffusion: BaseNNDiffusion,
@@ -84,6 +90,27 @@ class ContinuousFlowMap(DiffusionModel):
         # energy-tilted target (``_energy_tilt``); ``None`` (default) keeps the CFG target,
         # byte-identical to plain iSM/iMF. Set by the driver before training.
         self.energy_grad_fn = None
+        # Reward-loss (``ractd``) wiring — RACTD's L_Reward = −R(x̂₀) (arXiv:2506.07822 Eq. 8–9)
+        # ported onto the flow map. Set by the driver alongside ``energy_grad_fn``; **inert at
+        # these defaults** (``reward_sigma = 0``), so every existing net and checkpoint is
+        # byte-identical and the σ=0 reproduction gate holds by construction.
+        #   reward_grad_fn:    ``(x0_hat, cond) -> ∇r`` at the CLEAN sample — no ``t`` argument,
+        #                      because the whole point of the one-step head is that the reward
+        #                      is evaluated noise-free (RACTD §3.4).
+        #   reward_sigma:      the σ of ``L = … + σ·L_Reward``; a *training-time* knob, so unlike
+        #                      cfg's ``w`` it needs one net per value.
+        #   reward_placement:  where the reward pressure enters — ``"sc"`` (default; the jump /
+        #                      self-consistency branch, = RACTD's reward-aware *student*),
+        #                      ``"fm"`` (the instantaneous branch, = a reward-aware *teacher*,
+        #                      which is what every other in-weights family in this repo does),
+        #                      or ``"both"``. See planning/2026-07-27_ractd_reward_loss_arm.md.
+        #   reward_nfes:       step budgets the reward term is applied at, drawn uniformly per
+        #                      optimizer step. ``(1,)`` reproduces RACTD exactly; a wider tuple
+        #                      spreads the pressure so the model stays usable across the N axis.
+        self.reward_grad_fn = None
+        self.reward_sigma = 0.0
+        self.reward_placement = "sc"
+        self.reward_nfes = (1,)
         self.x_max = nn.Parameter(x_max, requires_grad=False) if x_max is not None else None
         self.x_min = nn.Parameter(x_min, requires_grad=False) if x_min is not None else None
 
@@ -151,6 +178,94 @@ class ContinuousFlowMap(DiffusionModel):
         corr = corr * at_least_ndim(torch.clamp(self.ENERGY_CORR_CAP / (cn + 1e-9), max=1.0),
                                     corr.dim())
         return (v + corr).detach()
+
+    # ---------------- reward loss (the ``ractd`` family) ----------------
+
+    def reward_active(self) -> bool:
+        """Whether the ``ractd`` reward term is live (hook set **and** ``σ > 0``). Every
+        reward code path is gated on this, so a net built without the hook — or with
+        ``σ = 0`` — trains exactly as it did before this feature existed."""
+        return self.reward_grad_fn is not None and self.reward_sigma > 0.0
+
+    def _reward_grad(self, x, cond_raw):
+        """Per-sample ``∇r`` at ``x``, norm-capped at ``REWARD_GRAD_CAP`` and detached.
+
+        Detaching is not an approximation: ``∇r`` is the gradient *evaluated at* ``x``, and
+        the surrogate below re-attaches it to the graph through ``x0_hat``. Caps are applied
+        per sample (the ``_energy_tilt`` idiom) so one runaway sample cannot dominate a batch.
+
+        Args:
+            x: Points at which to evaluate the reward gradient (clean samples for the loss,
+                noisy iterates for the ``fm`` tilt).
+            cond_raw: Raw condition slice handed to the callback, or ``None``.
+        """
+        g = self.reward_grad_fn(x, cond_raw)
+        if self.REWARD_GRAD_CAP > 0:
+            gn = g.flatten(1).norm(dim=1)
+            g = g * at_least_ndim(
+                torch.clamp(self.REWARD_GRAD_CAP / (gn + 1e-9), max=1.0), g.dim())
+        return g.detach()
+
+    def _reward_loss(self, x0_hat, cond_raw=None):
+        """RACTD's ``L_Reward = −R(x̂₀)`` (Eq. 8) as a linear surrogate ``−⟨x̂₀, ∇r⟩``.
+
+        The surrogate has the *same gradient* as ``−R(x̂₀)`` w.r.t. the network parameters —
+        ``∂/∂θ [−⟨x̂₀, sg(∇r)⟩] = −∇r·∂x̂₀/∂θ`` — while requiring only a ``∇r`` **callback**
+        rather than a torch-differentiable reward. That is what lets the analytic NumPy
+        rewards in ``toys/`` drive this loss at all; it is the same trick ``_energy_tilt``
+        uses for ``∇E``. Its *value* is not the reward and is not comparable across σ — read
+        ``reward_mean`` from the measure loop, not this scalar.
+
+        Args:
+            x0_hat: Differentiable one-/few-step sample ``x̂₀`` (from ``_reward_x0_hat``).
+            cond_raw: Raw condition slice for the callback, or ``None``.
+        """
+        g = self._reward_grad(x0_hat.detach(), cond_raw)
+        return -(x0_hat * g).flatten(1).sum(1).mean()
+
+    def _reward_x0_hat(self, x0, condition_cfg=None):
+        """Differentiable ``x̂₀`` for the reward loss — RACTD's ``G_θ(x_T, T, 0)``.
+
+        Routed through ``self.sample`` (not a hand-rolled rollout) so the reward gradient
+        lands on **exactly** the map used at inference, including the clean-inject and the
+        solver's step schedule; ``use_ema=False`` because the term must train the live
+        weights. The step budget is drawn from ``reward_nfes`` per call, which is what keeps
+        the net usable across the N axis instead of being tuned to one budget.
+
+        Args:
+            x0: Clean batch — supplies the shape and the ``fix_mask`` prior (pinned entries
+                keep their data values, as at inference).
+            condition_cfg: Condition input forwarded to ``sample``, or ``None``.
+        """
+        i = int(torch.randint(len(self.reward_nfes), (1,)).item())
+        x0_hat, _ = self.sample(
+            prior=x0, x1=torch.randn_like(x0), sample_steps=int(self.reward_nfes[i]),
+            use_ema=False, requires_grad=True, condition_cfg=condition_cfg,
+            w_cfg=0.0, preserve_history=False,
+        )
+        return x0_hat
+
+    def _reward_tilt(self, xt, t, v, cond_raw):
+        """Reward-tilted regression target ``(v + cap(σ·[t/(1−t)]·∇r(x_t))).detach()`` — the
+        ``fm`` placement arm, structurally identical to ``_energy_tilt`` with ``σ·∇r`` in
+        place of ``∇E``.
+
+        **The two are not the same object, and the gap is the point of this arm.** ``∇E`` is
+        the exact time-dependent ``∇log p_t − ∇log q_t``; ``∇r`` here is the *clean-sample*
+        reward gradient evaluated at the noisy iterate — precisely the noise-unaware reward
+        model RACTD §3.4 argues against ("predicting the correct reward from highly corrupted
+        input could be very challenging"). On ManyWell the two coincide at ``t=0`` (its tilt
+        is pointwise, gated in ``validate_e3``); on the GMM targets they differ even there,
+        because those tilt by component reweighting.
+
+        Args:
+            xt, t, v: Noised batch, times, and per-sample data velocity (regression base).
+            cond_raw: Raw condition slice for the callback, or ``None``.
+        """
+        gr = self._reward_grad(xt, cond_raw)
+        coef = torch.where((1.0 - t) < self.NOISE_GATE, torch.zeros_like(t),
+                           self.reward_sigma * t / (1.0 - t))
+        return (v + at_least_ndim(coef, gr.dim()) * gr).detach()
 
     def _null_cond_vec(self, model, n: int):
         """The label-dropout null token (zeroed condition embedding, ``(n, emb)``) for a

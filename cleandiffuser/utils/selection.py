@@ -88,6 +88,7 @@ def fit_value_net(
     lr: float = 3e-3,
     device: str = "cpu",
     generator: Optional[torch.Generator] = None,
+    net: Optional[LatentValue] = None,
 ) -> LatentValue:
     """Fit a small data-space critic ``V̂(x0) ≈ value`` on offline ``(x0, value)`` pairs.
 
@@ -106,13 +107,18 @@ def fit_value_net(
         lr: Adam learning rate.
         device: Torch device.
         generator: Optional RNG for minibatch indexing.
+        net: Optional pre-built ``LatentValue`` to train in place, instead of constructing one
+            here. Mirrors ``fit_cep_energy``'s ``net`` argument and exists for the same reason:
+            it lets the fit be checkpointed like any other net (``ractd_v`` needs the critic as
+            a DAG node, so the model store must be able to rebuild it for loading). Default
+            ``None`` keeps the historical construct-here behaviour, byte-identical for ``boN_v``.
 
     Returns:
         A trained (eval-mode) :class:`~cleandiffuser.nn_prior.LatentValue` callable ``(B, dim) → (B,)``.
     """
     x = torch.as_tensor(x0, dtype=torch.float32, device=device).reshape(-1, dim)
     y = torch.as_tensor(value, dtype=torch.float32, device=device).reshape(-1)
-    vhat = LatentValue(dim, hidden=hidden, depth=depth).to(device)
+    vhat = (LatentValue(dim, hidden=hidden, depth=depth) if net is None else net).to(device)
     opt = torch.optim.Adam(vhat.parameters(), lr=lr)
     n = x.shape[0]
     vhat.train()

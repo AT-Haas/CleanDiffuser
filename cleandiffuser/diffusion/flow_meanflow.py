@@ -216,6 +216,14 @@ class ContinuousMeanFlow(ContinuousFlowMap):
             # label-dropout null token, stop-grad; 2026-07-14_run_review F1).
             w_in = self._sample_w(B)
             v_eff = self._cfg_tilt(xt, t, v, w_in, cond_emb, r=t)
+        elif self.reward_active() and self.reward_placement in ("fm", "both"):
+            # ractd `fm` placement — the teacher-equivalent position (ablation arm, see
+            # ContinuousShortcutFlow.loss). Note the asymmetry with shortcut is deliberate
+            # and pre-existing: here the tilt rides the whole identity (including the JVP
+            # tangent below when imf_vloss is off), because that is the unique correct port
+            # of the MeanFlow objective — cf. the class-docstring note at flow_shortcut.py:80.
+            v_eff = self._reward_tilt(
+                xt, t, v, condition if isinstance(condition, torch.Tensor) else None)
         elif self.baked_cfg and cond_emb is not None:
             with torch.no_grad():
                 u_cond = self.model["diffusion"](xt, t, cond_emb, r=t)
@@ -273,10 +281,22 @@ class ContinuousMeanFlow(ContinuousFlowMap):
         else:
             total_loss = mse.mean()
 
+        # ---------- Reward loss (ractd; RACTD arXiv:2506.07822 Eq. 8–9) ----------
+        # "sc" placement: the gradient reaches the net only through the sampled rollout,
+        # every query of which has r < t — the mean-flow (jump) field, MeanFlow's analogue of
+        # shortcut's SC branch. The r=t diagonal is untouched. See ContinuousShortcutFlow.loss.
+        loss_reward = x0.new_zeros(())
+        if self.reward_active() and self.reward_placement in ("sc", "both"):
+            loss_reward = self._reward_loss(
+                self._reward_x0_hat(x0, condition),
+                condition if isinstance(condition, torch.Tensor) else None)
+            total_loss = total_loss + self.reward_sigma * loss_reward
+
         if return_components:
             loss_fm = mse[fm_mask].mean().detach() if bool(fm_mask.any()) else x0.new_zeros(())
             loss_mf = mse[~fm_mask].mean().detach() if bool((~fm_mask).any()) else x0.new_zeros(())
-            return total_loss, {"loss_fm": loss_fm, "loss_mf": loss_mf}
+            return total_loss, {"loss_fm": loss_fm, "loss_mf": loss_mf,
+                                "loss_reward": loss_reward.detach()}
         return total_loss
 
     def training_step(self, batch, batch_idx):

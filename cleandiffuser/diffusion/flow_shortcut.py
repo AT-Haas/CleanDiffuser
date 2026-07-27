@@ -228,6 +228,14 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
                 # null token + w=0, stop-grad; 2026-07-14_run_review F1).
                 w_fm = self._sample_w(B_fm)
                 target_fm = self._cfg_tilt(xt_fm, t_fm, v_fm, w_fm, cond_fm, d=d_fm)
+            elif self.reward_active() and self.reward_placement in ("fm", "both"):
+                # ractd `fm` placement: put the reward pressure on the INSTANTANEOUS field,
+                # i.e. the teacher-equivalent position every other in-weights family here
+                # uses. This is the ablation arm, not the default — RACTD's Table 5 puts a
+                # reward-aware teacher at 96.0/96.2 against 109.5 for a reward-aware student.
+                target_fm = self._reward_tilt(
+                    xt_fm, t_fm, v_fm,
+                    condition[:B_fm] if isinstance(condition, torch.Tensor) else None)
             else:
                 target_fm = v_fm
             pred_fm = self.model["diffusion"](xt_fm, t_fm, cond_fm, d=d_fm, w=w_fm)
@@ -284,8 +292,24 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
             loss_sc = ((pred_sc - target_sc) ** 2 * self.loss_weight * (1 - self.fix_mask)).mean()
             total_loss = total_loss + loss_sc * (B_sc / B)
 
+        # ---------- Reward loss (ractd; RACTD arXiv:2506.07822 Eq. 8–9) ----------
+        # Default placement is "sc": the gradient reaches the net only through the sampled
+        # rollout, whose every query is at d>0 — the jump map, RACTD's *student*. The d=0 FM
+        # target above is untouched, which is the invariant `validate_guidance` gates on.
+        # NOTE this deliberately breaks the class docstring's "SC bootstrap is target-agnostic"
+        # property: the jump map is no longer the faithful self-consistent distillation of the
+        # d=0 field. That divergence IS the mechanism (a displacement, not a reweighting) and
+        # is readable from the loss_fm/loss_sc gap — it is not a bug.
+        loss_reward = x0.new_zeros(())
+        if self.reward_active() and self.reward_placement in ("sc", "both"):
+            loss_reward = self._reward_loss(
+                self._reward_x0_hat(x0, condition),
+                condition if isinstance(condition, torch.Tensor) else None)
+            total_loss = total_loss + self.reward_sigma * loss_reward
+
         if return_components:
-            return total_loss, {"loss_fm": loss_fm.detach(), "loss_sc": loss_sc.detach()}
+            return total_loss, {"loss_fm": loss_fm.detach(), "loss_sc": loss_sc.detach(),
+                                "loss_reward": loss_reward.detach()}
         return total_loss
 
     def training_step(self, batch, batch_idx):

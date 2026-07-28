@@ -262,6 +262,24 @@ class ContinuousFlowMap(DiffusionModel):
         x0_hat = xt + at_least_ndim(t, xt.dim()) * vel
         return x0_hat * (1.0 - self.fix_mask) + x0 * self.fix_mask
 
+    def reward_loss_total(self, x0, condition_cfg=None, cond_raw=None):
+        """The placement-resolved reward loss — the single entry point both backbones call.
+
+        ``"both"`` genuinely means *two* terms (instantaneous x₀-prediction **plus** the
+        rollout), which is why this exists rather than a lone ``_reward_x0_hat``: that
+        returns one tensor, so ``"both"`` silently degenerated to ``"sc"`` and its ablation
+        row came out bit-identical to the ``sc`` row.
+
+        Args:
+            x0: Clean batch. condition_cfg: condition input or ``None``.
+            cond_raw: Raw condition slice for the ∇r callback, or ``None``.
+        """
+        if self.reward_placement == "both":
+            return (self._reward_loss(self._reward_x0_hat_anyt(x0, condition_cfg,
+                                                               instantaneous=True), cond_raw)
+                    + self._reward_loss(self._reward_x0_hat(x0, condition_cfg), cond_raw))
+        return self._reward_loss(self._reward_x0_hat(x0, condition_cfg), cond_raw)
+
     def _reward_x0_hat(self, x0, condition_cfg=None):
         """Differentiable ``x̂₀`` for the reward loss — RACTD's ``G_θ(x_T, T, 0)``.
 
@@ -276,7 +294,7 @@ class ContinuousFlowMap(DiffusionModel):
                 keep their data values, as at inference).
             condition_cfg: Condition input forwarded to ``sample``, or ``None``.
         """
-        if self.reward_placement in ("anyt", "fm_loss"):
+        if self.reward_placement in ("anyt", "fm_loss"):  # "both" handled above
             return self._reward_x0_hat_anyt(
                 x0, condition_cfg, instantaneous=(self.reward_placement == "fm_loss"))
         i = int(torch.randint(len(self.reward_nfes), (1,)).item())

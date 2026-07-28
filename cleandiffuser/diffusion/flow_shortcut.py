@@ -294,8 +294,8 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
         # is readable from the loss_fm/loss_sc gap — it is not a bug.
         loss_reward = x0.new_zeros(())
         if self.reward_active() and self.reward_placement in ("sc", "anyt", "fm_loss", "both"):
-            loss_reward = self._reward_loss(
-                self._reward_x0_hat(x0, condition),
+            loss_reward = self.reward_loss_total(
+                x0, condition,
                 condition if isinstance(condition, torch.Tensor) else None)
             total_loss = total_loss + self.reward_sigma * loss_reward
 

@@ -286,7 +286,7 @@ class ContinuousMeanFlow(ContinuousFlowMap):
         # every query of which has r < t — the mean-flow (jump) field, MeanFlow's analogue of
         # shortcut's SC branch. The r=t diagonal is untouched. See ContinuousShortcutFlow.loss.
         loss_reward = x0.new_zeros(())
-        if self.reward_active() and self.reward_placement in ("sc", "both"):
+        if self.reward_active() and self.reward_placement in ("sc", "anyt", "both"):
             loss_reward = self._reward_loss(
                 self._reward_x0_hat(x0, condition),
                 condition if isinstance(condition, torch.Tensor) else None)
@@ -328,6 +328,12 @@ class ContinuousMeanFlow(ContinuousFlowMap):
 
     def _default_w_cfg(self) -> float:
         return 1.0
+
+    def _jump_to_data(self, model, xt, t, condition_vec):
+        """MeanFlow jump to data: the average velocity over ``[0, t]`` (``r = 0``) — the
+        ``anyt`` placement's span-``t`` query, mirroring ``ContinuousShortcutFlow``."""
+        return model["diffusion"](xt, t, condition_vec, r=torch.zeros_like(t),
+                                  w=torch.zeros_like(t) if self.guided else None)
 
     def _step_velocity(self, model, xt, t, t_curr, t_next, condition_vec_cfg, w, w_cfg):
         """MeanFlow per-step velocity: one forward integrating ``[t_next, t_curr]`` via

@@ -61,6 +61,10 @@ class ContinuousFlowMap(DiffusionModel):
     # σ≈1 (arXiv:2506.07822 App. E.4 Table 15: 0.8→108.3, 1.5→50.5, 2.0→17.0), an
     # uncapped-correction failure; set to 0 to disable the cap and reproduce that cliff.
     REWARD_GRAD_CAP: float = 50.0
+    # Per-sample cap on the *correction* the `fm` placement adds to the FM target — the
+    # reward-side twin of ENERGY_CORR_CAP, and distinct from the ∇r cap above: the tilt
+    # coefficient σ·t/(1−t) is what blows up near the noise end, not the gradient.
+    REWARD_CORR_CAP: float = 50.0
 
     def __init__(
         self,
@@ -223,6 +227,39 @@ class ContinuousFlowMap(DiffusionModel):
         g = self._reward_grad(x0_hat.detach(), cond_raw)
         return -(x0_hat * g).flatten(1).sum(1).mean()
 
+    def _jump_to_data(self, model, xt, t, condition_vec):
+        """One jump straight to data from a **per-sample** noise level ``t`` (span ``= t``):
+        the model's ``x̂₀`` estimate at ``t``, i.e. ``G_θ(x_t, t, 0)``. Backbone-specific only
+        in the span kwarg (shortcut ``d=t`` / meanflow ``r=0``); returns the velocity, the
+        caller integrates. Used by the ``anyt`` reward placement."""
+        raise NotImplementedError
+
+    def _reward_x0_hat_anyt(self, x0, condition_cfg=None):
+        """``x̂₀`` from a **sampled** noise level rather than from pure noise — the ``anyt``
+        placement.
+
+        ``_reward_x0_hat`` rewards ``G_θ(x_T, T, 0)``, one point on the jump ladder (span 1),
+        which is why its effect is confined to the budgets it is trained at. This instead
+        draws ``t ~ U[0,1]`` and rewards ``G_θ(x_t, t, 0)`` — span ``t``, so over training it
+        touches **every** span at **one** forward pass, where covering the ladder by rollout
+        costs ``E[N]``. It is the reward-side analogue of how the DSM branch covers all ``t``,
+        and it is still a legitimate RACTD port: CTM's ``G_θ(x_t, t, 0)`` is defined for any
+        ``t``; RACTD simply evaluates it at ``t = T``.
+
+        Args:
+            x0: Clean batch — supplies the shape, the diffusion endpoint and the fix_mask prior.
+            condition_cfg: Condition input, or ``None``.
+        """
+        t = torch.rand((x0.shape[0],), device=self.device)
+        eps = torch.randn_like(x0)
+        xt = x0 + at_least_ndim(t, x0.dim()) * (eps - x0)
+        xt = xt * (1.0 - self.fix_mask) + x0 * self.fix_mask
+        cvec = (self.model["condition"](condition_cfg)
+                if (condition_cfg is not None and self._has_condition) else None)
+        vel = self._jump_to_data(self.model, xt, t, cvec)
+        x0_hat = xt + at_least_ndim(t, xt.dim()) * vel
+        return x0_hat * (1.0 - self.fix_mask) + x0 * self.fix_mask
+
     def _reward_x0_hat(self, x0, condition_cfg=None):
         """Differentiable ``x̂₀`` for the reward loss — RACTD's ``G_θ(x_T, T, 0)``.
 
@@ -237,6 +274,8 @@ class ContinuousFlowMap(DiffusionModel):
                 keep their data values, as at inference).
             condition_cfg: Condition input forwarded to ``sample``, or ``None``.
         """
+        if self.reward_placement == "anyt":
+            return self._reward_x0_hat_anyt(x0, condition_cfg)
         i = int(torch.randint(len(self.reward_nfes), (1,)).item())
         x0_hat, _ = self.sample(
             prior=x0, x1=torch.randn_like(x0), sample_steps=int(self.reward_nfes[i]),
@@ -265,7 +304,17 @@ class ContinuousFlowMap(DiffusionModel):
         gr = self._reward_grad(xt, cond_raw)
         coef = torch.where((1.0 - t) < self.NOISE_GATE, torch.zeros_like(t),
                            self.reward_sigma * t / (1.0 - t))
-        return (v + at_least_ndim(coef, gr.dim()) * gr).detach()
+        corr = at_least_ndim(coef, gr.dim()) * gr
+        # Cap the CORRECTION, not just ∇r — the same guard _energy_tilt applies, and it is
+        # load-bearing here: t ~ U[0,1] on the FM branch and the gate only fires at
+        # 1−t < 1e-3, so coef = σ·t/(1−t) reaches ~500 (p99 ≈ 46 at σ=0.5) and its mean
+        # diverges logarithmically. Without this the FM target is dominated by a handful of
+        # near-noise samples — measured: loss_fm 1.48 → 27.4, i.e. the arm was fitting a
+        # wrecked field, not a tilted one.
+        cn = corr.flatten(1).norm(dim=1)
+        corr = corr * at_least_ndim(torch.clamp(self.REWARD_CORR_CAP / (cn + 1e-9), max=1.0),
+                                    corr.dim())
+        return (v + corr).detach()
 
     def _null_cond_vec(self, model, n: int):
         """The label-dropout null token (zeroed condition embedding, ``(n, emb)``) for a

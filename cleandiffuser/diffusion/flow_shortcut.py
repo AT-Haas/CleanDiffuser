@@ -301,7 +301,7 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
         # d=0 field. That divergence IS the mechanism (a displacement, not a reweighting) and
         # is readable from the loss_fm/loss_sc gap — it is not a bug.
         loss_reward = x0.new_zeros(())
-        if self.reward_active() and self.reward_placement in ("sc", "both"):
+        if self.reward_active() and self.reward_placement in ("sc", "anyt", "both"):
             loss_reward = self._reward_loss(
                 self._reward_x0_hat(x0, condition),
                 condition if isinstance(condition, torch.Tensor) else None)
@@ -342,6 +342,11 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
 
     def _default_w_cfg(self) -> float:
         return 0.0
+
+    def _jump_to_data(self, model, xt, t, condition_vec):
+        """Shortcut jump to data: one forward at span ``d = t`` (the ``anyt`` placement)."""
+        return model["diffusion"](xt, t, condition_vec, d=t,
+                                  w=torch.zeros_like(t) if self.guided else None)
 
     def _step_velocity(self, model, xt, t, t_curr, t_next, condition_vec_cfg, w, w_cfg):
         """Shortcut per-step velocity: one forward at step size ``d = t_curr − t_next``.

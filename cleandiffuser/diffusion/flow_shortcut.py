@@ -228,14 +228,6 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
                 # null token + w=0, stop-grad; 2026-07-14_run_review F1).
                 w_fm = self._sample_w(B_fm)
                 target_fm = self._cfg_tilt(xt_fm, t_fm, v_fm, w_fm, cond_fm, d=d_fm)
-            elif self.reward_active() and self.reward_placement in ("fm", "both"):
-                # ractd `fm` placement: put the reward pressure on the INSTANTANEOUS field,
-                # i.e. the teacher-equivalent position every other in-weights family here
-                # uses. This is the ablation arm, not the default — RACTD's Table 5 puts a
-                # reward-aware teacher at 96.0/96.2 against 109.5 for a reward-aware student.
-                target_fm = self._reward_tilt(
-                    xt_fm, t_fm, v_fm,
-                    condition[:B_fm] if isinstance(condition, torch.Tensor) else None)
             else:
                 target_fm = v_fm
             pred_fm = self.model["diffusion"](xt_fm, t_fm, cond_fm, d=d_fm, w=w_fm)
@@ -301,7 +293,7 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
         # d=0 field. That divergence IS the mechanism (a displacement, not a reweighting) and
         # is readable from the loss_fm/loss_sc gap — it is not a bug.
         loss_reward = x0.new_zeros(())
-        if self.reward_active() and self.reward_placement in ("sc", "anyt", "both"):
+        if self.reward_active() and self.reward_placement in ("sc", "anyt", "fm_loss", "both"):
             loss_reward = self._reward_loss(
                 self._reward_x0_hat(x0, condition),
                 condition if isinstance(condition, torch.Tensor) else None)
@@ -343,9 +335,9 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
     def _default_w_cfg(self) -> float:
         return 0.0
 
-    def _jump_to_data(self, model, xt, t, condition_vec):
+    def _jump_to_data(self, model, xt, t, condition_vec, instantaneous: bool = False):
         """Shortcut jump to data: one forward at span ``d = t`` (the ``anyt`` placement)."""
-        return model["diffusion"](xt, t, condition_vec, d=t,
+        return model["diffusion"](xt, t, condition_vec, d=torch.zeros_like(t) if instantaneous else t,
                                   w=torch.zeros_like(t) if self.guided else None)
 
     def _step_velocity(self, model, xt, t, t_curr, t_next, condition_vec_cfg, w, w_cfg):

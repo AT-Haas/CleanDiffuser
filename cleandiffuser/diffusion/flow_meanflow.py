@@ -216,14 +216,6 @@ class ContinuousMeanFlow(ContinuousFlowMap):
             # label-dropout null token, stop-grad; 2026-07-14_run_review F1).
             w_in = self._sample_w(B)
             v_eff = self._cfg_tilt(xt, t, v, w_in, cond_emb, r=t)
-        elif self.reward_active() and self.reward_placement in ("fm", "both"):
-            # ractd `fm` placement — the teacher-equivalent position (ablation arm, see
-            # ContinuousShortcutFlow.loss). Note the asymmetry with shortcut is deliberate
-            # and pre-existing: here the tilt rides the whole identity (including the JVP
-            # tangent below when imf_vloss is off), because that is the unique correct port
-            # of the MeanFlow objective — cf. the class-docstring note at flow_shortcut.py:80.
-            v_eff = self._reward_tilt(
-                xt, t, v, condition if isinstance(condition, torch.Tensor) else None)
         elif self.baked_cfg and cond_emb is not None:
             with torch.no_grad():
                 u_cond = self.model["diffusion"](xt, t, cond_emb, r=t)
@@ -286,7 +278,7 @@ class ContinuousMeanFlow(ContinuousFlowMap):
         # every query of which has r < t — the mean-flow (jump) field, MeanFlow's analogue of
         # shortcut's SC branch. The r=t diagonal is untouched. See ContinuousShortcutFlow.loss.
         loss_reward = x0.new_zeros(())
-        if self.reward_active() and self.reward_placement in ("sc", "anyt", "both"):
+        if self.reward_active() and self.reward_placement in ("sc", "anyt", "fm_loss", "both"):
             loss_reward = self._reward_loss(
                 self._reward_x0_hat(x0, condition),
                 condition if isinstance(condition, torch.Tensor) else None)
@@ -329,10 +321,10 @@ class ContinuousMeanFlow(ContinuousFlowMap):
     def _default_w_cfg(self) -> float:
         return 1.0
 
-    def _jump_to_data(self, model, xt, t, condition_vec):
+    def _jump_to_data(self, model, xt, t, condition_vec, instantaneous: bool = False):
         """MeanFlow jump to data: the average velocity over ``[0, t]`` (``r = 0``) — the
         ``anyt`` placement's span-``t`` query, mirroring ``ContinuousShortcutFlow``."""
-        return model["diffusion"](xt, t, condition_vec, r=torch.zeros_like(t),
+        return model["diffusion"](xt, t, condition_vec, r=t if instantaneous else torch.zeros_like(t),
                                   w=torch.zeros_like(t) if self.guided else None)
 
     def _step_velocity(self, model, xt, t, t_curr, t_next, condition_vec_cfg, w, w_cfg):

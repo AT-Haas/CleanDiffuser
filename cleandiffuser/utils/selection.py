@@ -89,6 +89,9 @@ def fit_value_net(
     device: str = "cpu",
     generator: Optional[torch.Generator] = None,
     net: Optional[LatentValue] = None,
+    history: Optional[dict] = None,
+    probe=None,
+    probe_every: Optional[int] = None,
 ) -> LatentValue:
     """Fit a small data-space critic ``V̂(x0) ≈ value`` on offline ``(x0, value)`` pairs.
 
@@ -112,19 +115,44 @@ def fit_value_net(
             it lets the fit be checkpointed like any other net (``ractd_v`` needs the critic as
             a DAG node, so the model store must be able to rebuild it for loading). Default
             ``None`` keeps the historical construct-here behaviour, byte-identical for ``boN_v``.
+        history: Optional dict this fills with the fit's convergence trace — ``"mse"`` per step
+            (free; the number is already computed) and, with a ``probe``, ``"probe"`` in the
+            ``{"step": [...], "<key>": [...]}`` shape the study's loss plotters read. Without it
+            a finished critic carries no evidence of whether its fit had converged, which is the
+            gap that makes ``boN_v``'s over-optimization story unfalsifiable from stored output.
+        probe: Optional ``fn(net, step) -> {name: float}`` run under ``no_grad`` on the eval-mode
+            net (e.g. held-out MSE + rank recovery). It must draw from its own RNG, never
+            ``generator``: the fitted weights then stay bit-identical to a probe-free run.
+            Requires ``history``.
+        probe_every: Probe period in steps; ``None`` derives ``steps // 20``, ``0`` disables.
 
     Returns:
         A trained (eval-mode) :class:`~cleandiffuser.nn_prior.LatentValue` callable ``(B, dim) → (B,)``.
     """
+    if probe is not None and history is None:
+        raise ValueError("fit_value_net probes require history (the results ride in it)")
     x = torch.as_tensor(x0, dtype=torch.float32, device=device).reshape(-1, dim)
     y = torch.as_tensor(value, dtype=torch.float32, device=device).reshape(-1)
     vhat = (LatentValue(dim, hidden=hidden, depth=depth) if net is None else net).to(device)
     opt = torch.optim.Adam(vhat.parameters(), lr=lr)
     n = x.shape[0]
+    if probe_every is None:
+        probe_every = max(1, int(steps) // 20)
     vhat.train()
-    for _ in range(int(steps)):
+    for it in range(int(steps)):
         idx = torch.randint(0, n, (batch,), generator=generator, device=device)
         loss = F.mse_loss(vhat(x[idx]), y[idx])
         opt.zero_grad(); loss.backward(); opt.step()
+        if history is not None:
+            history.setdefault("mse", []).append(float(loss))
+        if probe is not None and probe_every and ((it + 1) % probe_every == 0 or (it + 1) == steps):
+            vhat.eval()
+            with torch.no_grad():
+                vals = probe(vhat, it + 1)
+            vhat.train()
+            pr = history.setdefault("probe", {"step": []})
+            pr["step"].append(it + 1)
+            for k, v in vals.items():
+                pr.setdefault(k, []).append(float(v))
     vhat.eval()
     return vhat

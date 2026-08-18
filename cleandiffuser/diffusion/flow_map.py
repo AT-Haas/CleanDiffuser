@@ -21,7 +21,8 @@ from cleandiffuser.classifier import BaseClassifier
 from cleandiffuser.diffusion.basic import DiffusionModel
 from cleandiffuser.nn_condition import BaseNNCondition
 from cleandiffuser.nn_diffusion import BaseNNDiffusion
-from cleandiffuser.utils import TensorDict, at_least_ndim, get_sampling_scheduler, null_cond_emb
+from cleandiffuser.utils import (TensorDict, at_least_ndim, get_mask, get_sampling_scheduler,
+                                 null_cond_emb)
 
 log = logging.getLogger("cleandiffuser.diffusion.flow_map")
 
@@ -50,6 +51,11 @@ class ContinuousFlowMap(DiffusionModel):
         w_min, w_max: Training range the guidance scale ``w`` is sampled from.
     """
 
+    # The guidance scale at which the CFG blend `(1+w)·v_cond − w·v_uncond` is exactly the
+    # unconditional field: (1+w) = 0. Not a family convention — it falls out of the
+    # parameterization, which is why the FM anchor can short-circuit it arithmetically.
+    CFG_UNCOND_W: float = -1.0
+
     # Per-sample cap on the energy-guidance correction norm, and the noise-boundary gate
     # on 1−t below which the t/(1−t) tilt is forced to 0: the true tilt vanishes at pure
     # noise, and the gate stops the blow-up of a never-exactly-zero *learned* ∇E.
@@ -76,6 +82,7 @@ class ContinuousFlowMap(DiffusionModel):
         guided: bool = False,
         w_min: float = 0.0,
         w_max: float = 4.0,
+        cfg_uncond_anchor: bool = False,
     ):
         super().__init__(nn_diffusion, nn_condition, fix_mask, loss_weight, classifier,
                          ema_rate, optimizer_params)
@@ -84,6 +91,24 @@ class ContinuousFlowMap(DiffusionModel):
         self.guided = guided
         self.w_min = w_min
         self.w_max = w_max
+        # Repair for the measured `cfg` amortization tax (docs/plans/2026-08-11_guided_net_
+        # capacity_and_budget.md). Two coupled changes, both inert at the False default so
+        # every existing net and checkpoint is byte-identical:
+        #   train  — label-dropped rows are given the plain data target `v`, independent of w.
+        #            Their condition IS null, so v_cond == v_uncond and the correct target does
+        #            not depend on w at all; the historical `(1+w)v − w·v_uncond` is unbiased
+        #            for them but carries (1+w)² times the noise (3× on average over w~U[-1,2],
+        #            ~10× on maze2d's [0,4] hull) around a value that never moves — and at
+        #            w=−1 it carries no data whatsoever.
+        #   sample — at w = CFG_UNCOND_W the CFG blend is *exactly* the unconditional field,
+        #            so query the null token instead of asking the net to reproduce an identity
+        #            it can only learn. This is what the FM anchor already does
+        #            (backbones._anchor_span_velocity short-circuits both wc==0 and wc==1),
+        #            and it is why the anchor pays no tax while the flow maps do.
+        # Together they collapse the two slots that currently both represent q0 (the null token,
+        # which is data-trained, and w=−1, which was defined by pointing at it through the EMA)
+        # into the one that data can actually reach.
+        self.cfg_uncond_anchor = cfg_uncond_anchor
         # Optional external guidance-gradient hook ``(xt, t, cond) -> ∇E`` (same shape as
         # ``xt``; ``cond`` is the raw condition slice or None — condition-free callbacks
         # ignore it). When set on a guided model it swaps the CFG target for the
@@ -320,7 +345,38 @@ class ContinuousFlowMap(DiffusionModel):
             return None
         return null_cond_emb(model["diffusion"], n, self.device)
 
-    def _cfg_tilt(self, xt, t, v, w, cond_emb, **span_kwargs):
+    def _encode_condition(self, condition):
+        """Encode the condition, and (under ``cfg_uncond_anchor``) report which rows survived
+        label dropout.
+
+        The condition module already accepts an explicit ``mask=``; the historical call passes
+        none, so the module rolls its own Bernoulli mask internally and returns only the masked
+        embedding — the loss can never tell which rows were blanked, and gives them the same
+        w-dependent CFG target as conditional rows. Rolling the mask here and handing it in is
+        what makes that distinction available to :meth:`_cfg_tilt`.
+
+        Args:
+            condition: The raw condition batch, or ``None``.
+
+        Returns:
+            ``(cond_emb, keep)`` — the encoded condition and a ``(B,)`` float vector that is 1.0
+            on rows whose label survived and 0.0 on blanked rows, or ``None`` when the
+            distinction is unavailable or unused (no condition, eval mode, zero dropout, a
+            ``TensorDict`` condition, or the anchor disabled). With the anchor off this is the
+            historical single-argument call, so the RNG stream and the weights are untouched.
+        """
+        if condition is None or not self._has_condition:
+            return None, None
+        module = self.model["condition"]
+        if not self.cfg_uncond_anchor:
+            return module(condition), None
+        prob = float(getattr(module, "dropout", 0.0) or 0.0) if module.training else 0.0
+        if prob <= 0.0 or not isinstance(condition, torch.Tensor):
+            return module(condition), None
+        mask = get_mask(condition, prob, dims=0)
+        return module(condition, mask), mask.reshape(mask.shape[0], -1)[:, 0]
+
+    def _cfg_tilt(self, xt, t, v, w, cond_emb, keep=None, **span_kwargs):
         """CFG-tilted regression target ``((1+w)·v − w·v_uncond).detach()`` (iSM/iMF).
 
         ``v_uncond`` is the EMA net at the **label-dropout null token** (the zeroed
@@ -335,13 +391,45 @@ class ContinuousFlowMap(DiffusionModel):
             w: Per-sample guidance scales ``(B,)``.
             cond_emb: The encoded condition batch (non-``None`` in every guided branch);
                 only its shape/device seed the zeroed null token.
+            keep: Optional ``(B,)`` label-dropout survival mask from :meth:`_encode_condition`.
+                On blanked rows the condition *is* null, so ``v_cond == v_uncond`` and the
+                correct target is ``v_uncond`` for **every** ``w`` — the historical expression is
+                unbiased for them but scales the data noise by ``(1+w)²`` around a value that
+                does not move, and at ``w=−1`` contains no data at all. Given the mask, those
+                rows get the plain data velocity instead: exactly ``q0``'s target, which is the
+                only route by which data can reach the unconditional field (no sample carrying a
+                condition ``c`` is an unbiased draw of it, since ``E[v|x_t,c] = v_cond``).
             **span_kwargs: The subclass's span input (``d=`` / ``r=``).
         """
         with torch.no_grad():
             v_uncond = self.model_ema["diffusion"](xt, t, torch.zeros_like(cond_emb),
                                                    w=torch.zeros_like(t), **span_kwargs)
         ww = at_least_ndim(w, v.dim())
-        return ((1.0 + ww) * v - ww * v_uncond).detach()
+        target = (1.0 + ww) * v - ww * v_uncond
+        if keep is not None:
+            k = at_least_ndim(keep, v.dim())
+            target = k * target + (1.0 - k) * v
+        return target.detach()
+
+    def _anchor_uncond_cond(self, model, cond_vec, w, batch_size):
+        """Under ``cfg_uncond_anchor``, replace the condition with the null token at
+        ``w = CFG_UNCOND_W``, where the CFG blend is *exactly* the unconditional field.
+
+        The flow maps take ``w`` as a network input, so without this they must *learn* an
+        identity that is arithmetically known — and they learn it from a target built out of
+        their own EMA, which is the drift measured as the amortization tax. The FM anchor
+        computes it instead (``backbones._anchor_span_velocity``: ``wc == 0.0 ⇒ v_uncond``) and
+        pays no tax. Returns ``cond_vec`` unchanged whenever the anchor is off or ``w`` is any
+        other scale, so guided sampling is untouched.
+
+        Args:
+            model: The ``model``/``model_ema`` dict being sampled from. cond_vec: The encoded
+                condition (already non-``None`` at the call sites). w: This step's scale.
+                batch_size: Row count for the null token.
+        """
+        if self.cfg_uncond_anchor and float(w) == self.CFG_UNCOND_W:
+            return self._null_cond_vec(model, batch_size)
+        return cond_vec
 
     # ==================== shared sampling scaffold ====================
 

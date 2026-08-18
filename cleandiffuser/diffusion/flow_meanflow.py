@@ -22,7 +22,7 @@ from cleandiffuser.diffusion.flow_map import ContinuousFlowMap
 _flow_map_log = logging.getLogger("cleandiffuser.diffusion.flow_meanflow")
 from cleandiffuser.nn_condition import BaseNNCondition
 from cleandiffuser.nn_diffusion import BaseNNDiffusion
-from cleandiffuser.utils import TensorDict, at_least_ndim, concat_zeros, dict_apply
+from cleandiffuser.utils import TensorDict, at_least_ndim, concat_zeros, dict_apply, perf
 
 
 class ContinuousMeanFlow(ContinuousFlowMap):
@@ -121,11 +121,13 @@ class ContinuousMeanFlow(ContinuousFlowMap):
         guided: bool = False,
         w_min: float = 0.0,
         w_max: float = 4.0,
+        cfg_uncond_anchor: bool = False,
     ):
         super().__init__(
             nn_diffusion, nn_condition, fix_mask, loss_weight, classifier,
             ema_rate, optimizer_params, x_max=x_max, x_min=x_min,
             guided=guided, w_min=w_min, w_max=w_max,
+            cfg_uncond_anchor=cfg_uncond_anchor,
         )
         assert 0.0 < r_not_equal_t_ratio <= 1.0
 
@@ -186,8 +188,10 @@ class ContinuousMeanFlow(ContinuousFlowMap):
         eps = torch.randn_like(x0) if x1 is None else x1
         # Condition-free nets (``nn_condition=None``, e.g. the intrinsic-energy family, F7)
         # never see a cond input — ``condition`` then only feeds the ∇E callback below.
-        cond_emb = (self.model["condition"](condition)
-                    if (condition is not None and self._has_condition) else None)
+        # ``keep`` is the label-dropout survival mask, non-None only under
+        # ``cfg_uncond_anchor`` (see FlowMapModel._encode_condition); with the anchor off this
+        # is the historical single-argument call, byte-for-byte.
+        cond_emb, keep = self._encode_condition(condition)
 
         r, t, fm_mask = self._sample_r_t(B)
         xt = x0 + at_least_ndim(t, x0.dim()) * (eps - x0)  # (1-t)x0 + t·ε
@@ -215,7 +219,7 @@ class ContinuousMeanFlow(ContinuousFlowMap):
             # velocity (1+w)·v_cond − w·v_uncond (uncond from the EMA net at the
             # label-dropout null token, stop-grad; 2026-07-14_run_review F1).
             w_in = self._sample_w(B)
-            v_eff = self._cfg_tilt(xt, t, v, w_in, cond_emb, r=t)
+            v_eff = self._cfg_tilt(xt, t, v, w_in, cond_emb, r=t, keep=keep)
         elif self.baked_cfg and cond_emb is not None:
             with torch.no_grad():
                 u_cond = self.model["diffusion"](xt, t, cond_emb, r=t)
@@ -253,9 +257,14 @@ class ContinuousMeanFlow(ContinuousFlowMap):
         else:
             dz_dt = -v_eff
         if self.use_jvp:
-            u, dudt = torch.func.jvp(
-                fn, (xt, r, t), (dz_dt, torch.zeros_like(r), torch.ones_like(t))
-            )
+            # ``fused_sdpa`` is forced off here and only here: the flash / mem-efficient SDPA
+            # kernels carry no forward-mode AD rule on the pinned torch 2.2, so a JVP through
+            # them raises NotImplementedError. The rest of this net's forwards (the imf_vloss
+            # ``v_theta`` call above, and every sampling call) keep the fused path.
+            with perf.override(fused_sdpa=False):
+                u, dudt = torch.func.jvp(
+                    fn, (xt, r, t), (dz_dt, torch.zeros_like(r), torch.ones_like(t))
+                )
         else:
             # finite-difference du/dt along (dz=dz_dt, dr=0, dt=1)
             h = 1e-3
@@ -354,6 +363,9 @@ class ContinuousMeanFlow(ContinuousFlowMap):
             w_in = torch.full_like(t, w_eff)
             if condition_vec_cfg is None:
                 condition_vec_cfg = self._null_cond_vec(model, xt.shape[0])
+            # w = −1 is exactly the unconditional field; take it rather than learn it.
+            condition_vec_cfg = self._anchor_uncond_cond(model, condition_vec_cfg, w_eff,
+                                                         xt.shape[0])
             return model["diffusion"](xt, t, condition_vec_cfg, r=r, w=w_in)
         if condition_vec_cfg is None:
             return model["diffusion"](xt, t, self._null_cond_vec(model, xt.shape[0]), r=r)

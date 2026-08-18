@@ -19,6 +19,7 @@ from cleandiffuser.diffusion.flow_map import ContinuousFlowMap
 from cleandiffuser.nn_condition import BaseNNCondition
 from cleandiffuser.nn_diffusion import BaseNNDiffusion
 from cleandiffuser.utils import TensorDict, at_least_ndim, concat_zeros, dict_apply
+from cleandiffuser.utils.perf import PERF
 
 
 class ContinuousShortcutFlow(ContinuousFlowMap):
@@ -133,11 +134,13 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
         guided: bool = False,
         w_min: float = 0.0,
         w_max: float = 4.0,
+        cfg_uncond_anchor: bool = False,
     ):
         super().__init__(
             nn_diffusion, nn_condition, fix_mask, loss_weight, classifier,
             ema_rate, optimizer_params, x_max=x_max, x_min=x_min,
             guided=guided, w_min=w_min, w_max=w_max,
+            cfg_uncond_anchor=cfg_uncond_anchor,
         )
         assert 0.0 < fm_consistency_ratio < 1.0, "fm_consistency_ratio must be in (0, 1)."
         assert K_max >= 1, "K_max must be >= 1 (need at least d ∈ {1/2, 1})."
@@ -157,6 +160,35 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
         return ["euler_shortcut"]
 
     # ==================== Training ======================
+
+    def _student_forward(self, branches):
+        """Evaluate the trainable net on the live loss branches, optionally in a single call.
+
+        The FM and SC branches call the same network with the same signature and differ only
+        in their per-sample ``(xt, t, cond, d, w)`` inputs, so under
+        ``PERF.fused_branch_forward`` they are concatenated into one forward and the output
+        split back. That matters because the SC branch is only ``1 - fm_consistency_ratio`` of
+        the batch (12.5% by default), so as its own launch wave it pays a full ~300-dispatch
+        forward for an eighth of the work. Equivalent per sample, not bit-exact: the fused GEMM
+        reduces over a different tile decomposition.
+
+        Args:
+            branches: One ``(xt, t, cond, d, w)`` tuple per live branch, FM first. ``cond`` is
+                ``None`` on condition-free nets and ``w`` is ``None`` on unguided ones; both
+                agree across branches by construction, since one net has one configuration.
+
+        Returns:
+            Predictions aligned with ``branches``. Falls back to the per-branch calls whenever
+            the flag is off or only one branch is live, so a ``fm_consistency_ratio`` of 0 or 1
+            costs nothing here.
+        """
+        if not PERF.fused_branch_forward or len(branches) < 2:
+            return [self.model["diffusion"](xt, t, c, d=d, w=w) for xt, t, c, d, w in branches]
+        sizes = [b[0].shape[0] for b in branches]
+        cat = lambda i: (None if branches[0][i] is None  # noqa: E731 - one-line, local
+                         else torch.cat([b[i] for b in branches], dim=0))
+        out = self.model["diffusion"](cat(0), cat(1), cat(2), d=cat(3), w=cat(4))
+        return list(torch.split(out, sizes, dim=0))
 
     def loss(
         self,
@@ -185,8 +217,10 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
         # objective well-defined under random label dropout. Condition-free nets
         # (``nn_condition=None``, e.g. the intrinsic-energy family, F7) never see a
         # cond input — ``condition`` then only feeds the ∇E callback's tilt below.
-        cond_emb = (self.model["condition"](condition)
-                    if (condition is not None and self._has_condition) else None)
+        # ``keep`` is the label-dropout survival mask, non-None only under
+        # ``cfg_uncond_anchor`` (see FlowMapModel._encode_condition); with the anchor off this
+        # is the historical single-argument call, byte-for-byte.
+        cond_emb, keep = self._encode_condition(condition)
 
         B_fm = int(round(B * self.fm_consistency_ratio))
         B_fm = max(0, min(B, B_fm))
@@ -195,6 +229,12 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
         total_loss = x0.new_zeros(())
         loss_fm = x0.new_zeros(())  # raw FM-branch MSE (for component logging)
         loss_sc = x0.new_zeros(())  # raw SC-branch MSE (for component logging)
+        # Student-forward inputs, collected per live branch and evaluated once below. Deferring
+        # the FM call past the SC branch consumes no RNG (label dropout already happened in
+        # ``_encode_condition``, and the SC draws happen where they always did) and the two
+        # losses are still summed FM-then-SC, so with ``PERF.fused_branch_forward`` OFF this is
+        # bit-identical to calling the net inline in each branch.
+        branches, targets, tags = [], [], []
 
         # ---------- Flow-matching branch (d = 0) ----------
         if B_fm > 0:
@@ -227,12 +267,13 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
                 # (1+w)·v_cond − w·v_uncond (v_uncond from the EMA net at the label-dropout
                 # null token + w=0, stop-grad; 2026-07-14_run_review F1).
                 w_fm = self._sample_w(B_fm)
-                target_fm = self._cfg_tilt(xt_fm, t_fm, v_fm, w_fm, cond_fm, d=d_fm)
+                target_fm = self._cfg_tilt(xt_fm, t_fm, v_fm, w_fm, cond_fm, d=d_fm,
+                                           keep=None if keep is None else keep[:B_fm])
             else:
                 target_fm = v_fm
-            pred_fm = self.model["diffusion"](xt_fm, t_fm, cond_fm, d=d_fm, w=w_fm)
-            loss_fm = ((pred_fm - target_fm) ** 2 * self.loss_weight * (1 - self.fix_mask)).mean()
-            total_loss = total_loss + loss_fm * (B_fm / B)
+            branches.append((xt_fm, t_fm, cond_fm, d_fm, w_fm))
+            targets.append(target_fm)
+            tags.append("fm")
 
         # ---------- Self-consistency branch (d > 0) ----------
         if B_sc > 0:
@@ -280,9 +321,19 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
                 s2 = target_model["diffusion"](x_mid, t_mid, cond_sc, d=d_half, w=w_sc)
                 target_sc = (s1 + s2) / 2  # stop-grad target
 
-            pred_sc = self.model["diffusion"](xt_sc, t_sc, cond_sc, d=d_sc, w=w_sc)
-            loss_sc = ((pred_sc - target_sc) ** 2 * self.loss_weight * (1 - self.fix_mask)).mean()
-            total_loss = total_loss + loss_sc * (B_sc / B)
+            branches.append((xt_sc, t_sc, cond_sc, d_sc, w_sc))
+            targets.append(target_sc)
+            tags.append("sc")
+
+        # ---------- student forward(s), then both branch losses ----------
+        for tag, pred, target, args in zip(tags, self._student_forward(branches),
+                                           targets, branches):
+            mse = ((pred - target) ** 2 * self.loss_weight * (1 - self.fix_mask)).mean()
+            if tag == "fm":
+                loss_fm = mse
+            else:
+                loss_sc = mse
+            total_loss = total_loss + mse * (args[0].shape[0] / B)
 
         # ---------- Reward loss (ractd; RACTD arXiv:2506.07822 Eq. 8–9) ----------
         # Default placement is "sc": the gradient reaches the net only through the sampled
@@ -356,6 +407,8 @@ class ContinuousShortcutFlow(ContinuousFlowMap):
             # (condition_vec_cfg=None & w=0 ⇒ unconditional; w>0 ⇒ guided).
             if condition_vec_cfg is None:
                 condition_vec_cfg = self._null_cond_vec(model, xt.shape[0])
+            # w = −1 is exactly the unconditional field; take it rather than learn it.
+            condition_vec_cfg = self._anchor_uncond_cond(model, condition_vec_cfg, w, xt.shape[0])
             return model["diffusion"](xt, t, condition_vec_cfg, d=d_tensor, w=w)
         if w_cfg == 1.0 and condition_vec_cfg is not None:
             return model["diffusion"](xt, t, condition_vec_cfg, d=d_tensor)

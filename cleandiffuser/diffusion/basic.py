@@ -9,6 +9,7 @@ from cleandiffuser.classifier import BaseClassifier
 from cleandiffuser.nn_condition import BaseNNCondition, IdentityCondition
 from cleandiffuser.nn_diffusion import BaseNNDiffusion
 from cleandiffuser.utils import TensorDict
+from cleandiffuser.utils.perf import PERF
 
 
 class DiffusionModel(L.LightningModule):
@@ -153,8 +154,22 @@ class DiffusionModel(L.LightningModule):
             raise ValueError("Invalid optimizer configuration.")
 
     def ema_update(self):
-        """Update the EMA model."""
+        """Update the EMA model: ``p_ema <- r*p_ema + (1-r)*p``, once per optimizer step.
+
+        Under ``PERF.foreach_ema`` the same two ops run as multi-tensor ``torch._foreach_*``
+        calls over the whole parameter list instead of the Python loop below. That is
+        **bit-exact** — identical ops applied in identical order, elementwise — and collapses
+        the loop's two-kernel-launches-per-tensor into two launches total, i.e. ~128 to 2 on
+        the maze2d DiT (64 parameter tensors). Deliberately *not* ``_foreach_lerp_``, which
+        evaluates ``a + w*(b-a)`` and would reassociate the arithmetic.
+        """
         with torch.no_grad():
+            if PERF.foreach_ema:
+                ema = [p.data for p in self.model_ema.parameters()]
+                torch._foreach_mul_(ema, self.ema_rate)
+                torch._foreach_add_(ema, [p.data for p in self.model.parameters()],
+                                    alpha=1.0 - self.ema_rate)
+                return
             for p, p_ema in zip(self.model.parameters(), self.model_ema.parameters()):
                 p_ema.data.mul_(self.ema_rate).add_(p.data, alpha=1.0 - self.ema_rate)
 

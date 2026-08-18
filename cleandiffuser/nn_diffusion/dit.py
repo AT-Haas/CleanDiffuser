@@ -16,6 +16,7 @@ import torch.nn as nn
 
 from cleandiffuser.nn_diffusion import BaseNNDiffusion
 from cleandiffuser.utils import UntrainablePositionalEmbedding
+from cleandiffuser.utils.perf import PERF
 
 __all__ = ["DiT1d", "DiT1dWithACICrossAttention", "DiT1dShortcut", "DiT1dMeanFlow"]
 
@@ -96,8 +97,16 @@ class DiTBlock(nn.Module):
                 6, dim=-1
             )
 
+        # ``need_weights`` defaults to True, which forces ``nn.MultiheadAttention`` down the
+        # unfused branch: it materialises a (B*H, L, L) score matrix, softmaxes it, does a
+        # second bmm, then averages it over heads — and the ``[0]`` throws that average away.
+        # ``PERF.fused_sdpa`` asks for False instead, which routes to
+        # ``scaled_dot_product_attention``'s fused kernels. Equivalent, not bit-exact.
+        # At the maze2d shape (B=448, H=8, L=128) the discarded matrix alone is 235 MB per
+        # block per forward, held live for backward.
+        need_w = not PERF.fused_sdpa
         h = self.sa_norm(x) * (1 + scale_sa) + shift_sa
-        x = x + gate_sa * self.sa_attn(h, h, h)[0]
+        x = x + gate_sa * self.sa_attn(h, h, h, need_weights=need_w)[0]
 
         if self._use_cross_attn:
             if self._adaLN_on_cross_attn:
@@ -110,7 +119,8 @@ class DiTBlock(nn.Module):
                 x
                 + gate_ca
                 * self.ca_attn(
-                    h, seq_condition, seq_condition, key_padding_mask=seq_condition_mask
+                    h, seq_condition, seq_condition, key_padding_mask=seq_condition_mask,
+                    need_weights=need_w
                 )[0]
             )
 

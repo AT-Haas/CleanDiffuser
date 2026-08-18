@@ -7,17 +7,23 @@ under a behavior-regularization toward ``N(0, I)``. The denoiser ``g`` stays fro
 *where in noise space to start*, so inference is a single draw + one decode (no per-step guidance, no
 candidate resampling).
 
-Two pieces live here, both framework-agnostic (they take a frozen decoder and a value callable, never
+Three pieces live here, all framework-agnostic (they take a frozen decoder and a value callable, never
 touching the flow internals):
 
 * :class:`LearnableNoisePrior` — a diagonal Gaussian (``n_components=1``) or diagonal Gaussian mixture
   (``n_components>1``, natural for a multimodal target) over the initial noise, with reparameterized
-  sampling and a KL-to-``N(0,I)`` term.
+  sampling and a KL-to-``N(0,I)`` term. **Unconditional**: the right family wherever there is no state
+  to condition on (the analytic toys), and the ablation baseline elsewhere.
+* :class:`ConditionalNoisePrior` — the paper's actual prior ``p_ψ(x_T | s)``: a GRU over the plan
+  horizon emitting a per-step ``(mean, log_std)``, conditioned on the current state. Use this wherever
+  a state exists; :class:`LearnableNoisePrior` cannot express "for *this* state, shift noise *that*
+  way", which is the entire mechanism of the paper.
 * :class:`LatentValue` — the latent value ``V̄_φ(x_T) ≈ V(g(x_T))`` (paper Eq. 4), MSE-regressed so the
-  prior update (paper Eq. 5) never back-propagates through the frozen denoiser ``g``.
+  prior update (paper Eq. 5) never back-propagates through the frozen denoiser ``g``. Conditional fits
+  feed it ``concat([x_T, s])``, matching the reference, whose latent critic is state-conditioned too.
 
-:func:`fit_prior_guidance` runs the alternating fit; :func:`sample_with_prior` is the generic
-inference hook reused by downstream experiments.
+:func:`fit_prior_guidance` runs the alternating fit for either prior; :func:`sample_with_prior` is the
+generic inference hook reused by downstream experiments.
 """
 
 import math
@@ -50,20 +56,25 @@ class LearnableNoisePrior(nn.Module):
     diagonal-Gaussian mixture over the (flattened) initial noise. Sampling is reparameterized
     (pathwise-differentiable in the component means/log-stds); for a mixture the component index is a
     hard categorical draw, so the mixture ``logits`` receive gradient only through :meth:`log_prob`
-    (i.e. through the KL term), which is the intended behavior. ``E1`` is unconditional, so this is a
-    *global* prior (no state conditioning); the D4RL extension conditions an analogous net on the
-    observation. Documented simplification vs the reference (``github.com/ku-dmlab/PG``): the paper's
-    prior is a **network-parameterized, observation-conditioned** tanh-squashed Gaussian; ours is a
-    static (mixture-)Gaussian over the flattened noise — here conditioning enters via inpainting
-    instead (see ``planning/2026-07-07_code_review.md`` N7).
+    (i.e. through the KL term), which is the intended behavior.
+
+    **This is the unconditional arm.** On an unconditional target (the analytic toys) it *is* the
+    paper's family — ``p_ψ(x_T|s) ≡ p_ψ(x_T)`` when there is no ``s`` — and being a free parameter
+    table it is strictly more expressive there than a net emitting the same diagonal Gaussian. Where a
+    state does exist it is a deliberate ablation of :class:`ConditionalNoisePrior`, isolating what the
+    reference's observation conditioning buys; it cannot express a per-state shift, so conditioning
+    reaches it only through whatever the decoder inpaints (see ``planning/2026-07-07_code_review.md``
+    N7).
 
     Args:
         dim: Dimensionality of the (flattened) initial-noise vector (E1 ring toy: ``2``).
         n_components: Number of mixture components ``K`` (``1`` ⇒ a single diagonal Gaussian).
         init_std: Initial per-dim standard deviation (log-std initialized to ``log(init_std)``).
-        tanh_squash: If set, the component **means** are squashed as ``mean_scale·tanh(μ)`` (bounds the
-            shift, matching the repo's "tanh-squash on the mean"); the sample density given the mean is
-            still Gaussian, so no change-of-variables Jacobian is needed.
+        tanh_squash: If set, the component **means** are squashed as ``mean_scale·tanh(μ)``, bounding
+            the shift while leaving the sample density Gaussian given the mean, so no
+            change-of-variables Jacobian is needed. Note this is *ours*, not the reference's: PG
+            squashes the drawn **sample** (``pg.py:148``, ``tanh(z)·prior_squash_mean``) and takes the
+            KL on the pre-squash distribution — :class:`ConditionalNoisePrior` mirrors that instead.
         mean_scale: Squash amplitude used only when ``tanh_squash`` is set.
         logstd_min: Lower clamp on the log-std (numerical floor on the component spread).
         logstd_max: Upper clamp on the log-std (numerical ceiling on the component spread).
@@ -153,14 +164,115 @@ class LearnableNoisePrior(nn.Module):
         return (logq - std_normal_logprob(z)).mean()
 
 
+class ConditionalNoisePrior(nn.Module):
+    """State-conditioned learnable prior ``p_ψ(x_T | s)`` — the paper's actual prior net (PG §4).
+
+    A port of the reference ``TanhStochasticGRU`` (``ku-dmlab/PG``, ``network.py:504-559``): the
+    conditioning vector is projected once, then a GRU is unrolled over the plan horizon emitting a
+    per-step ``(mean, log_std)`` pair, giving a diagonal Gaussian over the ``(horizon, obs_dim)``
+    initial noise. Three details are load-bearing and are mirrored exactly:
+
+    * **The GRU is fed the projected condition at step 0 and zeros thereafter** — all temporal
+      structure flows through the hidden state, not through a repeated input. Feeding the condition
+      at every step instead is a different (and easier) model.
+    * **The squash is on the drawn sample**, ``tanh(z)·squash_scale``, not on the mean.
+    * **The KL is taken on the pre-squash Gaussian.** The reference does the same; it means the
+      regularizer measures the shift the net asked for, not the shift that survived the squash.
+
+    Why this class exists at all: the unconditional :class:`LearnableNoisePrior` learns one global
+    shift shared across every state, which is the average of the per-state optima rather than any of
+    them. Conditioning is the mechanism the paper is about, so the two are kept as separate arms and
+    measured against each other rather than one silently standing in for the other.
+
+    Single-Gaussian only (the paper's default; its Table 2 finds the mixture variant marginal and
+    domain-dependent), which is also why the KL is always available in closed form.
+
+    Args:
+        cond_dim: Conditioning-vector width (maze2d: ``obs_dim`` for the start state, ``+2`` when the
+            goal xy is also supplied).
+        horizon: Plan length in rows — the number of GRU unroll steps, so the emitted noise is
+            ``(horizon, obs_dim)``. All rows are emitted; the decoder's ``fix_mask`` overwrites the
+            pinned ones, keeping the flattened shape contract identical to the unconditional arm.
+        obs_dim: Per-row noise width.
+        hidden: GRU / projection width (reference default 256).
+        tanh_squash: Squash the drawn sample (reference default on for every D4RL domain).
+        squash_scale: Squash amplitude (reference ``prior_squash_mean``; 2.0 on maze2d).
+        logstd_min: Lower clamp on the log-std (reference ``LOG_STD_MIN = -5``).
+        logstd_max: Upper clamp on the log-std (reference ``LOG_STD_MAX = 2``).
+    """
+
+    def __init__(self, cond_dim: int, horizon: int, obs_dim: int, hidden: int = 256,
+                 tanh_squash: bool = True, squash_scale: float = 2.0,
+                 logstd_min: float = -5.0, logstd_max: float = 2.0):
+        super().__init__()
+        self.cond_dim, self.horizon, self.obs_dim = int(cond_dim), int(horizon), int(obs_dim)
+        self.dim = self.horizon * self.obs_dim
+        self.tanh_squash, self.squash_scale = bool(tanh_squash), float(squash_scale)
+        self.logstd_min, self.logstd_max = float(logstd_min), float(logstd_max)
+        self.inp = nn.Linear(self.cond_dim, hidden)
+        self.ln1 = nn.LayerNorm(hidden)
+        self.cell = nn.GRUCell(hidden, hidden)
+        self.ln2 = nn.LayerNorm(hidden)
+        self.mean_head = nn.Linear(hidden, self.obs_dim)
+        self.logstd_head = nn.Linear(hidden, self.obs_dim)
+
+    def forward(self, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Condition ``(B, cond_dim)`` → per-step ``(means, stds)``, each ``(B, horizon, obs_dim)``."""
+        x = F.relu(self.ln1(self.inp(cond)))
+        h = torch.zeros_like(x)
+        zeros = torch.zeros_like(x)
+        means, logstds = [], []
+        for step in range(self.horizon):
+            h = self.cell(x if step == 0 else zeros, h)
+            y = F.relu(self.ln2(h))
+            means.append(self.mean_head(y))
+            logstds.append(self.logstd_head(y))
+        mean = torch.stack(means, dim=1)
+        logstd = torch.stack(logstds, dim=1).clamp(self.logstd_min, self.logstd_max)
+        return mean, torch.exp(logstd)
+
+    def rsample(self, cond: torch.Tensor, generator: Optional[torch.Generator] = None
+                ) -> torch.Tensor:
+        """Reparameterized draw ``(B, horizon*obs_dim)``, flattened to match the unconditional arm.
+
+        Args:
+            cond: Conditioning batch ``(B, cond_dim)`` — one draw per row.
+            generator: Optional RNG (must live on this module's device) for reproducibility.
+        """
+        mean, std = self(cond)
+        eps = torch.randn(mean.shape, generator=generator, device=mean.device)
+        z = mean + std * eps
+        if self.tanh_squash:
+            z = torch.tanh(z) * self.squash_scale
+        return z.reshape(z.shape[0], self.dim)
+
+    def kl_to_standard_normal(self, cond: torch.Tensor) -> torch.Tensor:
+        """Behavior regularization ``E_s[KL(p_ψ(·|s) ‖ N(0, I))]`` (scalar; differentiable).
+
+        Closed form per condition (a single diagonal Gaussian), then averaged over the batch —
+        the reference's ``tfd.kl_divergence(dist, std_normal).mean()``. Taken on the **pre-squash**
+        distribution, as the reference does.
+
+        Args:
+            cond: Conditioning batch ``(B, cond_dim)``.
+        """
+        mean, std = self(cond)
+        var = std ** 2
+        return 0.5 * (mean ** 2 + var - 1.0 - torch.log(var)).sum(dim=(1, 2)).mean()
+
+
 class LatentValue(nn.Module):
     """Latent value ``V̄_φ(x_T) ≈ V(g(x_T))`` (PG Eq. 4): a small MLP regressing the *decoded* value.
 
     Regressing in noise space lets the prior update (Eq. 5) maximize value via this surrogate without
     differentiating through the frozen decoder ``g``.
 
+    A conditional fit feeds it ``concat([x_T, s])`` and sizes ``dim`` accordingly, matching the
+    reference, whose latent critic reads ``concat([obs, x_T])`` too: with a state-conditioned prior the
+    decoded value depends on the state, so a surrogate blind to it would be regressing an average.
+
     Args:
-        dim: Input (initial-noise) dimensionality.
+        dim: Input dimensionality — the flattened initial noise, plus ``cond_dim`` when conditional.
         hidden: Hidden width.
         depth: Number of hidden layers.
     """
@@ -201,7 +313,10 @@ def fit_prior_guidance(
     generator: Optional[torch.Generator] = None,
     prior_init: Optional[LearnableNoisePrior] = None,
     value_init: Optional[LatentValue] = None,
-) -> Tuple[LearnableNoisePrior, LatentValue, dict]:
+    cond_sampler: Optional[Callable[[int, Optional[torch.Generator]], torch.Tensor]] = None,
+    cond_dim: int = 0,
+    cond_prior_kwargs: Optional[dict] = None,
+) -> Tuple[nn.Module, LatentValue, dict]:
     """Fit one Prior-Guidance prior for a single ``alpha`` (PG Algorithm 1, alternating Eq. 4 / Eq. 5).
 
     Alternates (a) regressing the latent value ``V̄_φ`` toward ``value_fn(decode_fn(z))`` on a mix of
@@ -210,11 +325,20 @@ def fit_prior_guidance(
     samples (``decode_fn`` is never called in this phase). The decoder is treated as frozen — call it
     under ``no_grad``.
 
+    Passing ``cond_sampler`` switches to the **conditional** fit: the prior becomes a
+    :class:`ConditionalNoisePrior`, the latent value reads ``concat([z, cond])``, and both the value
+    target and the KL are taken per condition. Leaving it ``None`` takes the unconditional path
+    unchanged, byte for byte — the toys and the existing ``prior`` family depend on that.
+
     Args:
-        decode_fn: Frozen decoder ``z (B, dim) → x0 (B, *x_shape)`` (the behavior-cloned flow map at a
-            fixed step count). Should not require grad.
-        value_fn: Plan value ``x0 → (B,)`` (E1: ``target.reward``; D4RL: a learned critic).
-        dim: Initial-noise dimensionality.
+        decode_fn: Frozen decoder (the behavior-cloned flow map at a fixed step count), called under
+            ``no_grad``: ``z (B, dim) → x0 (B, *x_shape)`` unconditionally, or ``(z, cond) → x0`` when
+            ``cond_sampler`` is given. The conditional form must derive whatever the decoder inpaints
+            from ``cond`` itself, so the same closure serves the fit and the closed-loop rollout.
+        value_fn: Plan value ``x0 → (B,)``. Oracle on the ``_gt``-style arms (``target.reward`` on the
+            toys, the task verifier on maze2d); a learned offline critic on the ``_v`` arms, which is
+            what the reference uses and the only arm whose value error PG has to survive.
+        dim: Initial-noise dimensionality (flattened; excludes ``cond_dim``).
         alpha: Behavior-regularization coefficient (lower ⇒ stronger value-seeking; paper sweeps
             ``{50, 10, 1, 0.1, 0.01, 0.001}``).
         n_components: Mixture components for the prior (``1`` ⇒ single Gaussian).
@@ -236,18 +360,40 @@ def fit_prior_guidance(
         generator: Optional RNG (kept on ``device``) for reproducibility.
         prior_init: Optional warm-start prior (e.g. reuse across ``alpha`` / NFE); fresh if ``None``.
         value_init: Optional warm-start latent value; fresh if ``None``.
+        cond_sampler: ``fn(n, generator) -> cond (n, cond_dim)`` drawing conditioning states for the
+            fit. Supplying it selects the conditional fit; ``None`` keeps the unconditional one. Draw
+            from *training* states, not the evaluation batch — a conditional prior is the one arm with
+            something to generalize, so fitting it on the eval tasks would measure memorization.
+        cond_dim: Conditioning width; required (``> 0``) when ``cond_sampler`` is given.
+        cond_prior_kwargs: Extra :class:`ConditionalNoisePrior` args (``horizon``, ``obs_dim``,
+            ``hidden``, ``tanh_squash``, ``squash_scale``). ``horizon``/``obs_dim`` are required there,
+            and their product must equal ``dim``.
 
     Returns:
         ``(prior, value, history)`` where ``history`` logs per-round mean value / KL / losses.
     """
-    prior = prior_init if prior_init is not None else LearnableNoisePrior(
-        dim, n_components=n_components, tanh_squash=tanh_squash, mean_scale=mean_scale).to(device)
+    conditional = cond_sampler is not None
+    if conditional:
+        ck = dict(cond_prior_kwargs or {})
+        if cond_dim <= 0:
+            raise ValueError("a conditional fit needs cond_dim > 0")
+        if ck.get("horizon", 0) * ck.get("obs_dim", 0) != dim:
+            raise ValueError(f"cond_prior_kwargs horizon*obs_dim must equal dim={dim}, got {ck}")
+        prior = prior_init if prior_init is not None else ConditionalNoisePrior(
+            cond_dim, **ck).to(device)
+    else:
+        prior = prior_init if prior_init is not None else LearnableNoisePrior(
+            dim, n_components=n_components, tanh_squash=tanh_squash, mean_scale=mean_scale).to(device)
     value = value_init if value_init is not None else LatentValue(
-        dim, hidden=value_hidden, depth=value_depth).to(device)
+        dim + (cond_dim if conditional else 0), hidden=value_hidden, depth=value_depth).to(device)
     opt_v = torch.optim.Adam(value.parameters(), lr=lr)
     opt_p = torch.optim.Adam(prior.parameters(), lr=lr)
     hist = {"loss_v": [], "loss_p": [], "kl": [], "val": []}
     n0 = int(round(coverage_mix * batch))
+
+    def _v_in(z, cond):
+        """Latent-value input: the noise alone, or ``concat([z, cond])`` for a conditional fit."""
+        return z if cond is None else torch.cat([z, cond], dim=-1)
 
     for _ in range(int(rounds)):
         # (a) latent-value regression — no gradient through the frozen decoder g
@@ -256,11 +402,14 @@ def fit_prior_guidance(
         lv = 0.0
         for _ in range(int(value_steps)):
             with torch.no_grad():
+                cond = cond_sampler(batch, generator) if conditional else None
                 z_base = torch.randn(n0, dim, generator=generator, device=device)
-                z_pri = prior.rsample(batch - n0, generator=generator)
+                z_pri = (prior.rsample(cond[n0:], generator=generator) if conditional
+                         else prior.rsample(batch - n0, generator=generator))
                 z = torch.cat([z_base, z_pri], dim=0)
-                v_tgt = value_fn(decode_fn(z)).reshape(-1).to(device).float()
-            loss_v = F.mse_loss(value(z), v_tgt)
+                x0 = decode_fn(z, cond) if conditional else decode_fn(z)
+                v_tgt = value_fn(x0).reshape(-1).to(device).float()
+            loss_v = F.mse_loss(value(_v_in(z, cond)), v_tgt)
             opt_v.zero_grad(); loss_v.backward(); opt_v.step()
             lv = float(loss_v)
 
@@ -269,12 +418,18 @@ def fit_prior_guidance(
             p.requires_grad_(False)
         lp = kl_v = val_v = 0.0
         for _ in range(int(prior_steps)):
-            z, logq = prior.rsample_with_logprob(batch, generator=generator)
-            val = value(z)
-            if kl_estimator == "closed" or (kl_estimator == "auto" and prior.n_components == 1):
-                kl = prior.kl_to_standard_normal(estimator="closed")
+            if conditional:
+                cond = cond_sampler(batch, generator)
+                z = prior.rsample(cond, generator=generator)
+                kl = prior.kl_to_standard_normal(cond)
             else:
-                kl = (logq - std_normal_logprob(z)).mean()
+                cond = None
+                z, logq = prior.rsample_with_logprob(batch, generator=generator)
+                if kl_estimator == "closed" or (kl_estimator == "auto" and prior.n_components == 1):
+                    kl = prior.kl_to_standard_normal(estimator="closed")
+                else:
+                    kl = (logq - std_normal_logprob(z)).mean()
+            val = value(_v_in(z, cond))
             loss_p = -(val.mean() - float(alpha) * kl)
             opt_p.zero_grad(); loss_p.backward(); opt_p.step()
             lp, kl_v, val_v = float(loss_p), float(kl), float(val.mean())
@@ -297,6 +452,10 @@ def sample_with_prior(flow, prior_model: LearnableNoisePrior, sample_kwargs: dic
     Reused by downstream experiments (the E1 driver inlines the equivalent call so it can route the
     per-step metric suite). Any goal/state inpainting is handled by the flow's own ``fix_mask`` plus
     ``prior_inpaint`` — the learnable prior then effectively governs the free noise dimensions.
+
+    **Unconditional arm only.** A :class:`ConditionalNoisePrior` needs its condition at draw time and
+    its inpainting derived from that same condition, so the drivers call it directly rather than
+    through here.
 
     Args:
         flow: A frozen CleanDiffuser flow exposing ``sample(prior=, x1=, **sample_kwargs)``.

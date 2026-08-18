@@ -8,6 +8,7 @@ value callable.
 """
 
 from .learnable_prior import (
+    ConditionalNoisePrior,
     LearnableNoisePrior,
     LatentValue,
     fit_prior_guidance,
@@ -16,6 +17,7 @@ from .learnable_prior import (
 )
 
 __all__ = [
+    "ConditionalNoisePrior",
     "LearnableNoisePrior",
     "LatentValue",
     "fit_prior_guidance",

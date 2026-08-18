@@ -231,6 +231,21 @@ class ConditionalNoisePrior(nn.Module):
         logstd = torch.stack(logstds, dim=1).clamp(self.logstd_min, self.logstd_max)
         return mean, torch.exp(logstd)
 
+    def _draw(self, mean: torch.Tensor, std: torch.Tensor,
+              generator: Optional[torch.Generator]) -> torch.Tensor:
+        """Reparameterized draw from given ``(mean, std)``, squashed and flattened."""
+        z = mean + std * torch.randn(mean.shape, generator=generator, device=mean.device)
+        if self.tanh_squash:
+            z = torch.tanh(z) * self.squash_scale
+        return z.reshape(z.shape[0], self.dim)
+
+    @staticmethod
+    def _kl(mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+        """``E_s[KL(p_ψ(·|s) ‖ N(0, I))]`` from given ``(mean, std)`` — the reference's
+        ``tfd.kl_divergence(dist, std_normal).mean()``, on the **pre-squash** Gaussian."""
+        var = std ** 2
+        return 0.5 * (mean ** 2 + var - 1.0 - torch.log(var)).sum(dim=(1, 2)).mean()
+
     def rsample(self, cond: torch.Tensor, generator: Optional[torch.Generator] = None
                 ) -> torch.Tensor:
         """Reparameterized draw ``(B, horizon*obs_dim)``, flattened to match the unconditional arm.
@@ -239,26 +254,27 @@ class ConditionalNoisePrior(nn.Module):
             cond: Conditioning batch ``(B, cond_dim)`` — one draw per row.
             generator: Optional RNG (must live on this module's device) for reproducibility.
         """
-        mean, std = self(cond)
-        eps = torch.randn(mean.shape, generator=generator, device=mean.device)
-        z = mean + std * eps
-        if self.tanh_squash:
-            z = torch.tanh(z) * self.squash_scale
-        return z.reshape(z.shape[0], self.dim)
+        return self._draw(*self(cond), generator)
 
     def kl_to_standard_normal(self, cond: torch.Tensor) -> torch.Tensor:
         """Behavior regularization ``E_s[KL(p_ψ(·|s) ‖ N(0, I))]`` (scalar; differentiable).
 
-        Closed form per condition (a single diagonal Gaussian), then averaged over the batch —
-        the reference's ``tfd.kl_divergence(dist, std_normal).mean()``. Taken on the **pre-squash**
-        distribution, as the reference does.
-
         Args:
             cond: Conditioning batch ``(B, cond_dim)``.
         """
+        return self._kl(*self(cond))
+
+    def rsample_with_kl(self, cond: torch.Tensor, generator: Optional[torch.Generator] = None
+                        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(z, KL)`` from **one** GRU forward — what the prior update wants.
+
+        The fit needs both every step, and the unroll is the expensive part of this module, so
+        calling ``rsample`` then ``kl_to_standard_normal`` would double the cost of the phase the
+        2026-07-28 review already named the critical-path bottleneck. The draw is identical to
+        ``rsample``'s (one ``randn``, same order), so this is a saving, not a different model.
+        """
         mean, std = self(cond)
-        var = std ** 2
-        return 0.5 * (mean ** 2 + var - 1.0 - torch.log(var)).sum(dim=(1, 2)).mean()
+        return self._draw(mean, std, generator), self._kl(mean, std)
 
 
 class LatentValue(nn.Module):
@@ -420,8 +436,7 @@ def fit_prior_guidance(
         for _ in range(int(prior_steps)):
             if conditional:
                 cond = cond_sampler(batch, generator)
-                z = prior.rsample(cond, generator=generator)
-                kl = prior.kl_to_standard_normal(cond)
+                z, kl = prior.rsample_with_kl(cond, generator=generator)
             else:
                 cond = None
                 z, logq = prior.rsample_with_logprob(batch, generator=generator)

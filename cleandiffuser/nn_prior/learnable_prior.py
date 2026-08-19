@@ -20,12 +20,13 @@ touching the flow internals):
   way", which is the entire mechanism of the paper.
 * :class:`LatentValue` — the latent value ``V̄_φ(x_T) ≈ V(g(x_T))`` (paper Eq. 4), MSE-regressed so the
   prior update (paper Eq. 5) never back-propagates through the frozen denoiser ``g``. Conditional fits
-  feed it ``concat([x_T, s])``, matching the reference, whose latent critic is state-conditioned too.
+  feed it ``concat([s, x_T])``, matching the reference, whose latent critic is state-conditioned too.
 
 :func:`fit_prior_guidance` runs the alternating fit for either prior; :func:`sample_with_prior` is the
 generic inference hook reused by downstream experiments.
 """
 
+import copy
 import math
 from typing import Callable, Optional, Tuple
 
@@ -168,9 +169,10 @@ class ConditionalNoisePrior(nn.Module):
     """State-conditioned learnable prior ``p_ψ(x_T | s)`` — the paper's actual prior net (PG §4).
 
     A port of the reference ``TanhStochasticGRU`` (``ku-dmlab/PG``, ``network.py:504-559``): the
-    conditioning vector is projected once, then a GRU is unrolled over the plan horizon emitting a
-    per-step ``(mean, log_std)`` pair, giving a diagonal Gaussian over the ``(horizon, obs_dim)``
-    initial noise. Three details are load-bearing and are mirrored exactly:
+    conditioning vector is projected once, then a GRU emits a per-step ``(mean, log_std)`` pair for
+    the unfixed future rows, giving a diagonal Gaussian over ``(horizon - 1, obs_dim)`` initial
+    noise. The caller prepends the fixed current-state row, as in the reference. Four details are
+    load-bearing and are mirrored exactly:
 
     * **The GRU is fed the projected condition at step 0 and zeros thereafter** — all temporal
       structure flows through the hidden state, not through a repeated input. Feeding the condition
@@ -190,9 +192,8 @@ class ConditionalNoisePrior(nn.Module):
     Args:
         cond_dim: Conditioning-vector width (maze2d: ``obs_dim`` for the start state, ``+2`` when the
             goal xy is also supplied).
-        horizon: Plan length in rows — the number of GRU unroll steps, so the emitted noise is
-            ``(horizon, obs_dim)``. All rows are emitted; the decoder's ``fix_mask`` overwrites the
-            pinned ones, keeping the flattened shape contract identical to the unconditional arm.
+        horizon: Plan length in rows. The GRU unrolls ``horizon - 1`` times and emits only the
+            unfixed future rows; the caller prepends the observed current-state row/noise slot.
         obs_dim: Per-row noise width.
         hidden: GRU / projection width (reference default 256).
         tanh_squash: Squash the drawn sample (reference default on for every D4RL domain).
@@ -206,7 +207,9 @@ class ConditionalNoisePrior(nn.Module):
                  logstd_min: float = -5.0, logstd_max: float = 2.0):
         super().__init__()
         self.cond_dim, self.horizon, self.obs_dim = int(cond_dim), int(horizon), int(obs_dim)
-        self.dim = self.horizon * self.obs_dim
+        if self.horizon < 2:
+            raise ValueError("ConditionalNoisePrior requires a planner horizon of at least 2")
+        self.dim = (self.horizon - 1) * self.obs_dim
         self.tanh_squash, self.squash_scale = bool(tanh_squash), float(squash_scale)
         self.logstd_min, self.logstd_max = float(logstd_min), float(logstd_max)
         self.inp = nn.Linear(self.cond_dim, hidden)
@@ -217,12 +220,12 @@ class ConditionalNoisePrior(nn.Module):
         self.logstd_head = nn.Linear(hidden, self.obs_dim)
 
     def forward(self, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Condition ``(B, cond_dim)`` → per-step ``(means, stds)``, each ``(B, horizon, obs_dim)``."""
+        """Condition → future-row ``(means, stds)``, each ``(B, horizon-1, obs_dim)``."""
         x = F.relu(self.ln1(self.inp(cond)))
         h = torch.zeros_like(x)
         zeros = torch.zeros_like(x)
         means, logstds = [], []
-        for step in range(self.horizon):
+        for step in range(self.horizon - 1):
             h = self.cell(x if step == 0 else zeros, h)
             y = F.relu(self.ln2(h))
             means.append(self.mean_head(y))
@@ -244,17 +247,27 @@ class ConditionalNoisePrior(nn.Module):
         """``E_s[KL(p_ψ(·|s) ‖ N(0, I))]`` from given ``(mean, std)`` — the reference's
         ``tfd.kl_divergence(dist, std_normal).mean()``, on the **pre-squash** Gaussian."""
         var = std ** 2
-        return 0.5 * (mean ** 2 + var - 1.0 - torch.log(var)).sum(dim=(1, 2)).mean()
+        # TFP's MultivariateNormalDiag treats only obs_dim as the event dimension in
+        # the JAX reference. KL is summed over coordinates, then averaged over both
+        # batch and horizon rows. Summing the horizon would make alpha H-1 times stronger.
+        return 0.5 * (mean ** 2 + var - 1.0 - torch.log(var)).sum(dim=-1).mean()
 
     def rsample(self, cond: torch.Tensor, generator: Optional[torch.Generator] = None
                 ) -> torch.Tensor:
-        """Reparameterized draw ``(B, horizon*obs_dim)``, flattened to match the unconditional arm.
+        """Reparameterized future-row draw ``(B, (horizon-1)*obs_dim)``.
 
         Args:
             cond: Conditioning batch ``(B, cond_dim)`` — one draw per row.
             generator: Optional RNG (must live on this module's device) for reproducibility.
         """
         return self._draw(*self(cond), generator)
+
+    def mode(self, cond: torch.Tensor) -> torch.Tensor:
+        """Deterministic squashed mean used by the reference at evaluation."""
+        mean, _ = self(cond)
+        if self.tanh_squash:
+            mean = torch.tanh(mean) * self.squash_scale
+        return mean.reshape(mean.shape[0], self.dim)
 
     def kl_to_standard_normal(self, cond: torch.Tensor) -> torch.Tensor:
         """Behavior regularization ``E_s[KL(p_ψ(·|s) ‖ N(0, I))]`` (scalar; differentiable).
@@ -283,7 +296,7 @@ class LatentValue(nn.Module):
     Regressing in noise space lets the prior update (Eq. 5) maximize value via this surrogate without
     differentiating through the frozen decoder ``g``.
 
-    A conditional fit feeds it ``concat([x_T, s])`` and sizes ``dim`` accordingly, matching the
+    A conditional fit feeds it ``concat([s, x_T])`` and sizes ``dim`` accordingly, matching the
     reference, whose latent critic reads ``concat([obs, x_T])`` too: with a state-conditioned prior the
     decoded value depends on the state, so a surrogate blind to it would be regressing an average.
 
@@ -332,6 +345,8 @@ def fit_prior_guidance(
     cond_sampler: Optional[Callable[[int, Optional[torch.Generator]], torch.Tensor]] = None,
     cond_dim: int = 0,
     cond_prior_kwargs: Optional[dict] = None,
+    target_rate: float = 0.0,
+    normalize_value: bool = False,
 ) -> Tuple[nn.Module, LatentValue, dict]:
     """Fit one Prior-Guidance prior for a single ``alpha`` (PG Algorithm 1, alternating Eq. 4 / Eq. 5).
 
@@ -383,7 +398,14 @@ def fit_prior_guidance(
         cond_dim: Conditioning width; required (``> 0``) when ``cond_sampler`` is given.
         cond_prior_kwargs: Extra :class:`ConditionalNoisePrior` args (``horizon``, ``obs_dim``,
             ``hidden``, ``tanh_squash``, ``squash_scale``). ``horizon``/``obs_dim`` are required there,
-            and their product must equal ``dim``.
+            and ``(horizon - 1) * obs_dim`` must equal ``dim``.
+        target_rate: Polyak update rate for target prior/value networks. ``0`` keeps
+            the historical direct-update implementation; the PG Maze2D reference uses
+            ``0.005``.
+        normalize_value: Apply the reference's ``normalize_q`` rule to the prior
+            objective: multiply ``-E[V]`` by detached ``1 / E[|V|]``. This keeps
+            value scale from changing the effective KL coefficient; it does not
+            standardize critic regression targets. Off preserves older runs.
 
     Returns:
         ``(prior, value, history)`` where ``history`` logs per-round mean value / KL / losses.
@@ -393,8 +415,9 @@ def fit_prior_guidance(
         ck = dict(cond_prior_kwargs or {})
         if cond_dim <= 0:
             raise ValueError("a conditional fit needs cond_dim > 0")
-        if ck.get("horizon", 0) * ck.get("obs_dim", 0) != dim:
-            raise ValueError(f"cond_prior_kwargs horizon*obs_dim must equal dim={dim}, got {ck}")
+        if (ck.get("horizon", 0) - 1) * ck.get("obs_dim", 0) != dim:
+            raise ValueError(
+                f"cond_prior_kwargs (horizon-1)*obs_dim must equal dim={dim}, got {ck}")
         prior = prior_init if prior_init is not None else ConditionalNoisePrior(
             cond_dim, **ck).to(device)
     else:
@@ -404,12 +427,25 @@ def fit_prior_guidance(
         dim + (cond_dim if conditional else 0), hidden=value_hidden, depth=value_depth).to(device)
     opt_v = torch.optim.Adam(value.parameters(), lr=lr)
     opt_p = torch.optim.Adam(prior.parameters(), lr=lr)
+    tau = float(target_rate)
+    target_prior = copy.deepcopy(prior).eval() if tau > 0 else None
+    target_value = copy.deepcopy(value).eval() if tau > 0 else None
+    if target_prior is not None:
+        for p in target_prior.parameters():
+            p.requires_grad_(False)
+        for p in target_value.parameters():
+            p.requires_grad_(False)
     hist = {"loss_v": [], "loss_p": [], "kl": [], "val": []}
     n0 = int(round(coverage_mix * batch))
 
     def _v_in(z, cond):
-        """Latent-value input: the noise alone, or ``concat([z, cond])`` for a conditional fit."""
-        return z if cond is None else torch.cat([z, cond], dim=-1)
+        """Latent-value input: noise alone, or the reference order ``[state, future noise]``."""
+        return z if cond is None else torch.cat([cond, z], dim=-1)
+
+    @torch.no_grad()
+    def _polyak(target, source):
+        for pt, ps in zip(target.parameters(), source.parameters()):
+            pt.mul_(1.0 - tau).add_(ps, alpha=tau)
 
     for _ in range(int(rounds)):
         # (a) latent-value regression — no gradient through the frozen decoder g
@@ -420,13 +456,16 @@ def fit_prior_guidance(
             with torch.no_grad():
                 cond = cond_sampler(batch, generator) if conditional else None
                 z_base = torch.randn(n0, dim, generator=generator, device=device)
-                z_pri = (prior.rsample(cond[n0:], generator=generator) if conditional
-                         else prior.rsample(batch - n0, generator=generator))
+                draw_prior = target_prior if target_prior is not None else prior
+                z_pri = (draw_prior.rsample(cond[n0:], generator=generator) if conditional
+                         else draw_prior.rsample(batch - n0, generator=generator))
                 z = torch.cat([z_base, z_pri], dim=0)
                 x0 = decode_fn(z, cond) if conditional else decode_fn(z)
                 v_tgt = value_fn(x0).reshape(-1).to(device).float()
             loss_v = F.mse_loss(value(_v_in(z, cond)), v_tgt)
             opt_v.zero_grad(); loss_v.backward(); opt_v.step()
+            if target_value is not None:
+                _polyak(target_value, value)
             lv = float(loss_v)
 
         # (b) prior update — reparameterized; freeze the value net so only ψ moves
@@ -444,15 +483,24 @@ def fit_prior_guidance(
                     kl = prior.kl_to_standard_normal(estimator="closed")
                 else:
                     kl = (logq - std_normal_logprob(z)).mean()
-            val = value(_v_in(z, cond))
-            loss_p = -(val.mean() - float(alpha) * kl)
+            value_for_prior = target_value if target_value is not None else value
+            val = value_for_prior(_v_in(z, cond))
+            value_scale = ((1.0 / (val.detach().abs().mean() + 1e-6))
+                           if normalize_value else 1.0)
+            loss_p = -value_scale * val.mean() + float(alpha) * kl
             opt_p.zero_grad(); loss_p.backward(); opt_p.step()
+            if target_prior is not None:
+                _polyak(target_prior, prior)
             lp, kl_v, val_v = float(loss_p), float(kl), float(val.mean())
         hist["loss_v"].append(lv); hist["loss_p"].append(lp)
         hist["kl"].append(kl_v); hist["val"].append(val_v)
 
     for p in value.parameters():
         p.requires_grad_(True)
+    if target_prior is not None:
+        # PG evaluates the slowly moving target prior. Copy it through the existing
+        # return API so callers cannot accidentally evaluate the online parameters.
+        prior.load_state_dict(target_prior.state_dict())
     prior.eval()
     return prior, value, hist
 

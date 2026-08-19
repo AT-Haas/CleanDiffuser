@@ -62,6 +62,14 @@ class _Perf:
             range). Reduced precision.
         fused_adam: Build ``torch.optim.Adam`` with ``fused=True``. Different kernel, so not
             bit-exact even though the arithmetic is nominally the same.
+        tf32: Allow TF32 matmul on Ampere+, i.e. run the GEMMs on tensor cores at 10 mantissa
+            bits with fp32 accumulation. Unlike the rest of this block it is a **global torch
+            backend flag**, not a branch in our code, so setting it here has a process-wide side
+            effect (see :func:`_sync_backends`). Only ``matmul.allow_tf32`` is managed:
+            ``cudnn.allow_tf32`` already defaults to True in torch, every historical run of this
+            project therefore had TF32 convolutions on, and forcing it False when this switch is
+            off would silently change those runs rather than restore them. The nets here are
+            transformers with no convolutions, so that distinction costs nothing in practice.
         compile_net: ``torch.compile`` the diffusion network. **Shortcut only.** Measured
             2026-08-18 on torch 2.2.2: MeanFlow raises ``InternalTorchDynamoError: Cannot
             access data pointer of Tensor that doesn't have storage`` because Dynamo traces
@@ -73,7 +81,7 @@ class _Perf:
     """
 
     __slots__ = ("sync_free_telemetry", "foreach_ema", "fused_sdpa", "fused_branch_forward",
-                 "amp_dtype", "fused_adam", "compile_net")
+                 "amp_dtype", "fused_adam", "compile_net", "tf32")
 
     def __init__(self):
         reset(self)
@@ -97,6 +105,8 @@ def reset(perf: Optional["_Perf"] = None) -> "_Perf":
     perf.amp_dtype = None
     perf.fused_adam = False
     perf.compile_net = False
+    perf.tf32 = False
+    _sync_backends(perf)
     return perf
 
 
@@ -131,6 +141,7 @@ def configure(perf: Optional["_Perf"] = None, **flags) -> "_Perf":
         else:
             raise KeyError(
                 f"perf: unknown switch {name!r}; known: {sorted(_Perf.__slots__) + ['amp']}")
+    _sync_backends(perf)
     return perf
 
 
@@ -178,6 +189,23 @@ def override(perf: Optional["_Perf"] = None, **flags):
     finally:
         for name, value in saved.items():
             setattr(perf, name, value)
+        _sync_backends(perf)
+
+
+def _sync_backends(perf: "_Perf") -> None:
+    """Push the switches that are torch *backend* state, not our own branches, into torch.
+
+    Only ``tf32`` is such a switch today. It has to be pushed on every mutation rather than read
+    at the use site, because ``torch.backends`` is what the kernels consult; and it has to happen
+    inside the worker process, because these flags do not survive ``spawn`` (the reason
+    ``maze2d.apply_tf32`` existed before this block did).
+    """
+    if perf.tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True   # already torch's default; stated for symmetry
+    else:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        # cudnn is deliberately NOT forced off here: see the `tf32` attribute docs.
 
 
 def describe(perf: Optional["_Perf"] = None) -> str:

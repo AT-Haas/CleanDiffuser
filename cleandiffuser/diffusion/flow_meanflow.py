@@ -97,6 +97,14 @@ class ContinuousMeanFlow(ContinuousFlowMap):
             forward per ``r<t`` step. With the JVP stop-grad'd the two share the
             same ``target``/gradient *except* for this tangent. Inference is
             identical either way. Default ``False`` (compute-cheap baseline).
+        project_fixed_jvp_tangent (bool): Project the JVP state tangent onto the
+            free coordinates selected by ``1 - fix_mask``. In an inpainting
+            problem the fixed coordinates of ``z_t`` are clamped to ``x0`` and
+            therefore have zero path derivative. Leaving a nonzero tangent on a
+            fixed token can still alter free-token derivatives through attention,
+            even though the final residual is masked there. Default ``True``;
+            ``False`` exists only to reproduce checkpoints trained before this
+            conditional-path correction.
     """
 
     def __init__(
@@ -118,6 +126,7 @@ class ContinuousMeanFlow(ContinuousFlowMap):
         cfg_kappa: float = 0.0,
         use_jvp: bool = True,
         imf_vloss: bool = False,
+        project_fixed_jvp_tangent: bool = True,
         guided: bool = False,
         w_min: float = 0.0,
         w_max: float = 4.0,
@@ -139,6 +148,7 @@ class ContinuousMeanFlow(ContinuousFlowMap):
         self.cfg_kappa = cfg_kappa
         self.use_jvp = use_jvp
         self.imf_vloss = imf_vloss  # iMF v-loss: JVP tangent = model's own velocity v_θ
+        self.project_fixed_jvp_tangent = bool(project_fixed_jvp_tangent)
 
     @property
     def supported_solvers(self):
@@ -256,6 +266,13 @@ class ContinuousMeanFlow(ContinuousFlowMap):
             dz_dt = -v_theta
         else:
             dz_dt = -v_eff
+        # ``xt`` was clamped above on ``fix_mask`` coordinates, so those coordinates
+        # are constant along the conditional path and their true dz/dt is zero. This
+        # must happen before either derivative implementation: masking only the final
+        # loss cannot prevent a false fixed-token tangent from coupling into free-token
+        # derivatives through attention.
+        if self.project_fixed_jvp_tangent:
+            dz_dt = dz_dt * (1.0 - self.fix_mask)
         if self.use_jvp:
             # ``fused_sdpa`` is forced off here and only here: the flash / mem-efficient SDPA
             # kernels carry no forward-mode AD rule on the pinned torch 2.2, so a JVP through

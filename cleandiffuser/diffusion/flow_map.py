@@ -483,6 +483,14 @@ class ContinuousFlowMap(DiffusionModel):
                 a no-op for flow maps (no "diffusion-x" warmup); logs a WARNING if set.
             warm_start_reference / warm_start_forward_level: MPC-style re-planning start —
                 mix the previous plan with noise at the given level, integrate from there.
+                ``level`` is the **noise** weight in this module's ``t = 1`` noise convention:
+                ``x = level * eps + (1 - level) * reference``, integrated from ``t = level``.
+                STP (arXiv:2607.09336 §A.3) writes the same mixture as ``t = 0.3`` in the
+                opposite convention, so its 0.7-noise setting is ``level = 0.7`` here.  ``eps``
+                is the caller's ``x1`` when one is given, so an on/off contrast is paired.
+                ``sample_steps`` is **not** reduced: the same number of steps is compressed into
+                ``[0, level]``, which is STP's protocol.  Pass a lower ``sample_steps`` as well
+                for Diffuser's NFE-reducing variant (arXiv:2205.09991 §5.4).
         """
         solver = solver or self.supported_solvers[0]
         assert solver in self.supported_solvers, f"Solver {solver} is not supported."
@@ -503,9 +511,16 @@ class ContinuousFlowMap(DiffusionModel):
         prior = prior.to(self.device)
         if isinstance(warm_start_reference, torch.Tensor) and 0.0 < warm_start_forward_level < 1.0:
             warm_start_reference = warm_start_reference.to(self.device)
-            t_c = torch.ones_like(prior) * warm_start_forward_level
-            x1 = torch.randn_like(prior) * t_c + warm_start_reference * (1 - t_c)
+            assert prior.shape == warm_start_reference.shape, (
+                "prior and warm_start_reference must have the same shape")
+            # Consume the CALLER's noise when it supplies some. Drawing from the global torch
+            # stream here would make a warm-start contrast partly a noise contrast, and would
+            # silently ignore an explicitly passed x1; callers that key their rollout noise by
+            # (episode, step) rely on the mixture using exactly the draw they handed in.
+            eps = torch.randn_like(prior) if x1 is None else x1.to(self.device)
+            assert prior.shape == eps.shape, "prior and x1 must have the same shape"
             start_t = float(warm_start_forward_level)
+            x1 = eps * start_t + warm_start_reference * (1.0 - start_t)
         else:
             if x1 is None:
                 x1 = torch.randn_like(prior) * temperature
@@ -547,4 +562,5 @@ class ContinuousFlowMap(DiffusionModel):
             xt = xt.clip(self.x_min, self.x_max)
 
         sample_log["t_schedule"] = t_schedule
+        sample_log["start_t"] = start_t
         return xt, sample_log

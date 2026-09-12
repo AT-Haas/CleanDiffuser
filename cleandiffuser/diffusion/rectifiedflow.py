@@ -318,15 +318,28 @@ class DiscreteRectifiedFlow(DiffusionModel):
 
         model = self.model if not use_ema else self.model_ema
 
-        sampling_schedule_params = sampling_schedule_params or {}
+        # Copy: this dict is the caller's, and the keys written below would otherwise persist
+        # into later sample() calls that reuse the same object -- t_max especially, which would
+        # silently truncate a subsequent cold-start sample.
+        sampling_schedule_params = dict(sampling_schedule_params or {})
         sampling_schedule_params["T"] = self.diffusion_steps
 
         prior = prior.to(self.device)
         if isinstance(warm_start_reference, torch.Tensor) and 0 < warm_start_forward_level < 1:
             warm_start_reference = warm_start_reference.to(self.device)
-            diffusion_steps = int(warm_start_forward_level * self.diffusion_steps)
-            t_c = at_least_ndim(diffusion_steps / self.diffusion_steps, prior.dim())
-            x1 = torch.randn_like(prior) * t_c + warm_start_reference * (1 - t_c)
+            quantized_level = int(warm_start_forward_level * self.diffusion_steps)
+            t_c = at_least_ndim(quantized_level / self.diffusion_steps, prior.dim())
+            # Consume the CALLER's noise when it supplies some, so a warm-start contrast is not
+            # also a noise contrast (see ContinuousFlowMap.sample for the same reasoning).
+            eps = torch.randn_like(prior) if x1 is None else x1.to(self.device)
+            assert prior.shape == eps.shape, "prior and x1 must have the same shape"
+            x1 = eps * t_c + warm_start_reference * (1 - t_c)
+            # Warm start noises xt only to `t_max`, so the integration must START there.  Without
+            # this the loop still runs the full chain over a lightly-noised iterate and applies
+            # ~1x the velocity instead of ~t_max x.  `t_max` is the scheduler's own truncation
+            # knob, used here rather than a post-hoc rescale because the discrete schedule is
+            # built over integer steps of T (mirrors DiscreteDiffusionSDE.sample).
+            sampling_schedule_params["t_max"] = quantized_level / self.diffusion_steps
         else:
             if x1 is None:
                 x1 = torch.randn_like(prior) * temperature
@@ -674,13 +687,20 @@ class ContinuousRectifiedFlow(DiffusionModel):
         prior = prior.to(self.device)
         if isinstance(warm_start_reference, torch.Tensor) and 0.0 < warm_start_forward_level < 1.0:
             warm_start_reference = warm_start_reference.to(self.device)
-            t_c = torch.ones_like(prior) * warm_start_forward_level
-            x1 = torch.randn_like(prior) * t_c + warm_start_reference * (1 - t_c)
+            assert prior.shape == warm_start_reference.shape, (
+                "prior and warm_start_reference must have the same shape")
+            # Consume the CALLER's noise when it supplies some, so a warm-start contrast is not
+            # also a noise contrast (see ContinuousFlowMap.sample for the same reasoning).
+            eps = torch.randn_like(prior) if x1 is None else x1.to(self.device)
+            assert prior.shape == eps.shape, "prior and x1 must have the same shape"
+            start_t = float(warm_start_forward_level)
+            x1 = eps * start_t + warm_start_reference * (1.0 - start_t)
         else:
             if x1 is None:
                 x1 = torch.randn_like(prior) * temperature
             else:
                 assert prior.shape == x1.shape, "prior and x1 must have the same shape"
+            start_t = 1.0
 
         xt = x1
         xt = xt * (1.0 - self.fix_mask) + prior * self.fix_mask
@@ -696,6 +716,12 @@ class ContinuousRectifiedFlow(DiffusionModel):
         t_schedule = sampling_scheduler(
             sample_steps, device=self.device, **sampling_schedule_params
         )
+        # Warm start noises xt only to `start_t`, so the integration must START there. Without
+        # this the loop still runs t: 1 -> 0 over a state that lives at t = start_t, querying the
+        # net at t = 1 on a lightly-noised iterate and applying ~1x the velocity instead of
+        # ~start_t x. Mirrors ContinuousFlowMap.sample, which has always had it.
+        if start_t != 1.0:
+            t_schedule = t_schedule * start_t
 
         # ===================== Denoising Loop ========================
         loop_steps = [1] * diffusion_x_sampling_steps + list(range(1, sample_steps + 1))
@@ -741,6 +767,7 @@ class ContinuousRectifiedFlow(DiffusionModel):
             xt = xt.clip(self.x_min, self.x_max)
 
         log["t_schedule"] = t_schedule
+        log["start_t"] = start_t
 
         return xt, log
 
